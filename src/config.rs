@@ -26,6 +26,16 @@ history_length = 36
 blocked = []
 "#;
 
+/// Every key `config.toml` may contain.
+const KEYS: [&str; 6] = [
+    "source_order",
+    "cache_minutes",
+    "admin_op_level",
+    "admins",
+    "history_length",
+    "blocked",
+];
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
     pub source_order: Vec<Source>,
@@ -117,9 +127,17 @@ fn is_uuid(s: &str) -> bool {
 pub fn parse(text: &str) -> Result<Config, String> {
     let doc: DocumentMut = text.parse().map_err(|e| format!("config.toml: {e}"))?;
 
+    if let Some((key, _)) = doc.iter().find(|(key, _)| !KEYS.contains(key)) {
+        return Err(format!(
+            "unknown key `{key}` (known keys: {})",
+            KEYS.join(", ")
+        ));
+    }
+
     let mut source_order = Vec::new();
     for s in strings(&doc, "source_order")? {
-        let source = Source::parse(&s).ok_or_else(|| format!("unknown source `{s}`"))?;
+        let source =
+            Source::parse(&s).ok_or_else(|| format!("unknown source `{s}` in `source_order`"))?;
         if source_order.contains(&source) {
             return Err(format!("source `{s}` is listed twice"));
         }
@@ -142,7 +160,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
 
     let mut blocked = Vec::new();
     for b in strings(&doc, "blocked")? {
-        let (source, name) = parse_skin_key(&b)?;
+        let (source, name) = parse_skin_key(&b).map_err(|e| format!("`blocked`: {e}"))?;
         blocked.push(skin_key(source, &name));
     }
 
@@ -156,36 +174,134 @@ pub fn parse(text: &str) -> Result<Config, String> {
     })
 }
 
+const NOT_A_LIST: &str = "`blocked` must be a list of strings";
+
+// toml_edit keeps the text between two array values (comments, newlines, indentation)
+// as the prefix of the *following* value, and the text after the last comma as the
+// array's `trailing()`. A plain `push`/`retain` therefore puts a new entry on the last
+// entry's line and deletes the comment lines above a removed entry, so the edits below
+// move that text around by hand.
+
+fn prefix(value: &Value) -> String {
+    let raw = value.decor().prefix().and_then(|p| p.as_str());
+    raw.unwrap_or_default().to_string()
+}
+
+fn suffix(value: &Value) -> String {
+    let raw = value.decor().suffix().and_then(|s| s.as_str());
+    raw.unwrap_or_default().to_string()
+}
+
+fn trailing(array: &Array) -> String {
+    array.trailing().as_str().unwrap_or_default().to_string()
+}
+
+/// Without a trailing comma the text up to `]` hangs off the last value as its suffix.
+/// If it spans lines, moves it into `trailing()` (adding the comma) so that both layouts
+/// are edited the same way.
+fn normalise_tail(array: &mut Array) {
+    let Some(last) = array.len().checked_sub(1).and_then(|i| array.get_mut(i)) else {
+        return;
+    };
+    let tail = suffix(last);
+    if !tail.contains('\n') {
+        return;
+    }
+    last.decor_mut().set_suffix("");
+    let tail = tail + &trailing(array);
+    array.set_trailing(tail);
+    array.set_trailing_comma(true);
+}
+
+fn matches(value: &Value, entry: &str) -> bool {
+    value
+        .as_str()
+        .is_some_and(|s| s.eq_ignore_ascii_case(entry))
+}
+
+fn position(array: &Array, entry: &str) -> Option<usize> {
+    array.iter().position(|v| matches(v, entry))
+}
+
 /// Adds `entry` (already normalised `source:name`) to `blocked`, keeping comments and
 /// layout. Returns the new file text, or `None` if it was already blocked.
 pub fn add_blocked(text: &str, entry: &str) -> Result<Option<String>, String> {
+    debug_assert!(parse_skin_key(entry).is_ok());
     let mut doc: DocumentMut = text.parse().map_err(|e| format!("config.toml: {e}"))?;
     if !doc.contains_key("blocked") {
         doc["blocked"] = Item::Value(Value::Array(Array::new()));
     }
-    let array = doc["blocked"]
-        .as_array_mut()
-        .ok_or("`blocked` must be a list of strings")?;
-    if array
-        .iter()
-        .any(|v| v.as_str().is_some_and(|s| s.eq_ignore_ascii_case(entry)))
-    {
+    let array = doc["blocked"].as_array_mut().ok_or(NOT_A_LIST)?;
+    if position(array, entry).is_some() {
         return Ok(None);
     }
-    array.push(entry);
+
+    normalise_tail(array);
+    let tail = trailing(array);
+    match tail.rfind('\n') {
+        // `]` is on the last entry's line: a single-line list.
+        None => array.push(entry),
+        // `]` is on its own line: the entry gets its own line too, indented like the
+        // nearest entry that starts a line.
+        Some(newline) => {
+            let (before, closing) = tail.split_at(newline + 1);
+            let indent = array
+                .iter()
+                .map(prefix)
+                .filter_map(|p| p.rfind('\n').map(|i| p[i + 1..].to_string()))
+                .last()
+                .unwrap_or_else(|| "    ".to_string());
+            let mut value = Value::from(entry);
+            value.decor_mut().set_prefix(format!("{before}{indent}"));
+            value.decor_mut().set_suffix("");
+            array.push_formatted(value);
+            array.set_trailing(format!("\n{closing}"));
+            array.set_trailing_comma(true);
+        }
+    }
     Ok(Some(doc.to_string()))
+}
+
+/// Removes the value at `index`, keeping the comment lines around it. Only the rest of
+/// the removed entry's own line (its trailing comment) goes with it.
+fn remove_at(array: &mut Array, index: usize) {
+    let last = index + 1 == array.len();
+    let before = prefix(&array.remove(index));
+    // The text after the removed entry: the next value's prefix, or the array's tail.
+    let after = match array.get(index) {
+        Some(next) => prefix(next),
+        None => trailing(array),
+    };
+    let joined = match (before.rfind('\n'), after.find('\n')) {
+        // The entry had its own line: drop that line, keep the lines above and below.
+        (Some(b), Some(a)) => format!("{}{}", &before[..=b], &after[a + 1..]),
+        // The next entry was on the same line and takes this one's place.
+        (Some(_), None) => before,
+        // The entry ended a line shared with earlier entries, which keep its rest.
+        (None, Some(_)) => after,
+        (None, None) if last => after,
+        (None, None) => before,
+    };
+    match array.get_mut(index) {
+        Some(next) => next.decor_mut().set_prefix(joined),
+        None => array.set_trailing(joined),
+    }
 }
 
 /// Removes `entry` from `blocked`. Returns the new text, or `None` if it was not there.
 pub fn remove_blocked(text: &str, entry: &str) -> Result<Option<String>, String> {
+    debug_assert!(parse_skin_key(entry).is_ok());
     let mut doc: DocumentMut = text.parse().map_err(|e| format!("config.toml: {e}"))?;
-    let Some(array) = doc.get_mut("blocked").and_then(Item::as_array_mut) else {
+    let Some(item) = doc.get_mut("blocked") else {
         return Ok(None);
     };
-    let before = array.len();
-    array.retain(|v| !v.as_str().is_some_and(|s| s.eq_ignore_ascii_case(entry)));
-    if array.len() == before {
+    let array = item.as_array_mut().ok_or(NOT_A_LIST)?;
+    if position(array, entry).is_none() {
         return Ok(None);
+    }
+    normalise_tail(array);
+    while let Some(index) = position(array, entry) {
+        remove_at(array, index);
     }
     Ok(Some(doc.to_string()))
 }
@@ -226,17 +342,49 @@ mod tests {
         assert!(!c.is_blocked(Source::Ely, "notch"));
     }
 
+    fn err(text: &str) -> String {
+        parse(text).unwrap_err()
+    }
+
     #[test]
     fn invalid_values_are_rejected() {
-        assert!(parse(r#"source_order = ["minecraft"]"#).is_err());
-        assert!(parse(r#"source_order = ["ely", "ely"]"#).is_err());
-        assert!(parse("source_order = []").is_err());
-        assert!(parse("admin_op_level = 5").is_err());
-        assert!(parse("cache_minutes = 0").is_err());
-        assert!(parse(r#"admins = ["not-a-uuid"]"#).is_err());
-        assert!(parse(r#"blocked = ["Notch"]"#).is_err());
-        assert!(parse("cache_minutes = \"x\"").is_err());
+        assert!(err(r#"source_order = ["minecraft"]"#).contains("in `source_order`"));
+        assert!(err(r#"source_order = ["ely", "ely"]"#).contains("listed twice"));
+        assert!(err("source_order = []").contains("at least one source"));
+        assert!(err("admin_op_level = 5").contains("`admin_op_level` must be between 0 and 4"));
+        assert!(err("cache_minutes = 0").contains("`cache_minutes` must be between 1 and 525600"));
+        assert!(err(r#"admins = ["not-a-uuid"]"#).contains("`admins`"));
+        assert!(err(r#"blocked = ["Notch"]"#).starts_with("`blocked`: "));
+        assert!(err(r#"blocked = ["nope:Notch"]"#).starts_with("`blocked`: "));
+        assert!(err("cache_minutes = \"x\"").contains("`cache_minutes` must be an integer"));
+        assert!(err("admins = [1]").contains("`admins` must be a list of strings"));
+        assert!(err("blocked = \"x\"").contains("`blocked` must be a list of strings"));
         assert!(parse("this is not toml").is_err());
+    }
+
+    #[test]
+    fn range_edges() {
+        assert!(parse("cache_minutes = 525600").is_ok());
+        assert!(err("cache_minutes = 525601").contains("`cache_minutes` must be between"));
+        assert!(err("history_length = 1001").contains("`history_length` must be between"));
+        assert_eq!(parse("history_length = 0").unwrap().history_length, 0);
+        assert!(err("admin_op_level = -1").contains("`admin_op_level` must be between"));
+    }
+
+    #[test]
+    fn unknown_keys_are_rejected() {
+        let e = err("cache_minuts = 5");
+        assert!(e.contains("`cache_minuts`"), "{e}");
+        for key in [
+            "source_order",
+            "cache_minutes",
+            "admin_op_level",
+            "admins",
+            "history_length",
+            "blocked",
+        ] {
+            assert!(e.contains(key), "{e}");
+        }
     }
 
     #[test]
@@ -269,5 +417,123 @@ mod tests {
         );
         assert!(parse_skin_key("notch").is_err());
         assert!(parse_skin_key("ely:../x").is_err());
+    }
+
+    const MULTI: &str = r#"blocked = [
+  # griefers
+  "mojang:a", # why a
+  # b is next
+  "ely:b", # why b
+]
+"#;
+
+    /// The edit result, which must still be a valid config.
+    fn edited(result: Result<Option<String>, String>) -> String {
+        let text = result.unwrap().unwrap();
+        parse(&text).unwrap();
+        text
+    }
+
+    #[test]
+    fn multi_line_add_goes_on_its_own_line() {
+        assert_eq!(
+            edited(add_blocked(MULTI, "ely:new")),
+            r#"blocked = [
+  # griefers
+  "mojang:a", # why a
+  # b is next
+  "ely:b", # why b
+  "ely:new",
+]
+"#
+        );
+    }
+
+    #[test]
+    fn multi_line_remove_keeps_other_comments() {
+        assert_eq!(
+            edited(remove_blocked(MULTI, "mojang:a")),
+            r#"blocked = [
+  # griefers
+  # b is next
+  "ely:b", # why b
+]
+"#
+        );
+        assert_eq!(
+            edited(remove_blocked(MULTI, "ely:b")),
+            r#"blocked = [
+  # griefers
+  "mojang:a", # why a
+  # b is next
+]
+"#
+        );
+        let only = "blocked = [\n  # griefers\n  \"mojang:a\", # why a\n]\n";
+        assert_eq!(
+            edited(remove_blocked(only, "mojang:a")),
+            "blocked = [\n  # griefers\n]\n"
+        );
+    }
+
+    #[test]
+    fn multi_line_without_trailing_comma() {
+        let text = "blocked = [\n  \"mojang:a\",\n  \"ely:b\" # why b\n]\n";
+        assert_eq!(
+            edited(add_blocked(text, "ely:new")),
+            "blocked = [\n  \"mojang:a\",\n  \"ely:b\", # why b\n  \"ely:new\",\n]\n"
+        );
+        assert_eq!(
+            edited(remove_blocked(text, "ely:b")),
+            "blocked = [\n  \"mojang:a\",\n]\n"
+        );
+        assert_eq!(
+            edited(remove_blocked(text, "mojang:a")),
+            "blocked = [\n  \"ely:b\", # why b\n]\n"
+        );
+    }
+
+    #[test]
+    fn multi_line_empty_array_add() {
+        assert_eq!(
+            edited(add_blocked("blocked = [\n  # none yet\n]\n", "ely:new")),
+            "blocked = [\n  # none yet\n    \"ely:new\",\n]\n"
+        );
+    }
+
+    #[test]
+    fn single_line_edits() {
+        let text = "blocked = [] # inline\n";
+        let added = edited(add_blocked(text, "mojang:notch"));
+        assert_eq!(added, "blocked = [\"mojang:notch\"] # inline\n");
+        assert_eq!(edited(remove_blocked(&added, "mojang:notch")), text);
+
+        let two = edited(add_blocked("blocked = [\"mojang:a\"]\n", "ely:b"));
+        assert_eq!(two, "blocked = [\"mojang:a\", \"ely:b\"]\n");
+        assert_eq!(
+            edited(remove_blocked(&two, "mojang:a")),
+            "blocked = [\"ely:b\"]\n"
+        );
+        assert_eq!(
+            edited(remove_blocked(&two, "ely:b")),
+            "blocked = [\"mojang:a\"]\n"
+        );
+    }
+
+    #[test]
+    fn remove_ignores_case_and_takes_duplicates() {
+        let text = "blocked = [\"Mojang:A\", \"ely:b\", \"mojang:a\"]\n";
+        assert_eq!(
+            edited(remove_blocked(text, "MOJANG:a")),
+            "blocked = [\"ely:b\"]\n"
+        );
+    }
+
+    #[test]
+    fn edits_reject_a_non_list() {
+        let text = "blocked = \"x\"\n";
+        let add = add_blocked(text, "ely:b").unwrap_err();
+        assert_eq!(remove_blocked(text, "ely:b").unwrap_err(), add);
+        assert_eq!(remove_blocked("cache_minutes = 5\n", "ely:b"), Ok(None));
     }
 }
