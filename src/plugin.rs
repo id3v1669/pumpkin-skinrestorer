@@ -19,7 +19,7 @@ wit_bindgen::generate!({
 });
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::io::ErrorKind;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -43,7 +43,7 @@ use crate::config::{self, Config, DEFAULT_CONFIG, skin_key};
 use crate::http;
 use crate::lookup::{Engine, Outcome, QueryId, ReqId};
 use crate::resolve::{Apply, Cooldowns, Ops, Superseded, is_admin, may_commit, plan_login};
-use crate::skin::{profile_component, steve};
+use crate::skin::{profile_component, skin_url, steve};
 use crate::source::{SkinData, Source};
 use crate::store::{self, Cache, CachedSkin, Choice, PlayerRecord, Players, player_key, to_json};
 
@@ -80,15 +80,18 @@ enum Purpose {
     Skull {
         issuer: Issuer,
         recipient: Uuid,
+        recipient_name: String,
         recipient_key: String,
+        /// Account name as typed; it names the head.
+        name: String,
     },
     /// Queued at login; `dedupe` is its entry in `State::login_lookups`.
     Login {
-        player: Uuid,
         dedupe: String,
-        /// Textures value applied at login, if any: the player is only told about a
-        /// skin they are not already wearing.
-        applied: Option<String>,
+        /// Every player waiting for this lookup, with the skin URL applied at their
+        /// login, if any: a player is only told about a skin they are not already
+        /// wearing.
+        waiters: Vec<(Uuid, Option<String>)>,
     },
 }
 
@@ -97,7 +100,9 @@ enum Effect {
     Tell(Issuer, String),
     TellPlayer(Uuid, String),
     GiveSkull {
+        issuer: Issuer,
         recipient: Uuid,
+        recipient_name: String,
         name: String,
         skin: SkinData,
     },
@@ -113,7 +118,10 @@ struct State {
     purposes: HashMap<QueryId, Purpose>,
     ops: Ops,
     cooldowns: Cooldowns,
-    login_lookups: HashSet<String>,
+    /// Running login lookups by dedupe key.
+    login_lookups: HashMap<String, QueryId>,
+    /// `skins.json` needs writing at the end of the tick.
+    cache_dirty: bool,
 }
 
 thread_local! {
@@ -165,18 +173,20 @@ impl State {
     }
 
     /// The record for a player, created if missing, with name and UUID kept current.
-    fn record(&mut self, name: &str, uuid: &str) -> (String, &mut PlayerRecord) {
+    /// The flag tells whether it was created or modified.
+    fn record(&mut self, name: &str, uuid: &str) -> (String, &mut PlayerRecord, bool) {
         let key = player_key(self.online_mode, name, uuid);
-        let record = self
-            .players
-            .players
-            .entry(key.clone())
-            .or_insert_with(|| PlayerRecord::new(name, uuid));
+        let mut changed = false;
+        let record = self.players.players.entry(key.clone()).or_insert_with(|| {
+            changed = true;
+            PlayerRecord::new(name, uuid)
+        });
         if record.name != name || record.uuid != uuid {
             record.name = name.to_string();
             record.uuid = uuid.to_string();
+            changed = true;
         }
-        (key, record)
+        (key, record, changed)
     }
 
     /// Sources to try for `spec`, without those where the name is blocked.
@@ -191,14 +201,14 @@ impl State {
             .collect()
     }
 
-    /// First unexpired cached skin among `sources`.
+    /// Unexpired cached skin of the first of `sources`. Lower-ranked sources are not
+    /// consulted: the source order wins, so they need a lookup.
     fn fresh_cached(&self, sources: &[Source], name: &str, now: u64) -> Option<(Source, SkinData)> {
-        sources.iter().find_map(|&s| {
-            self.cache
-                .get(s, name)
-                .filter(|c| !c.is_expired(now / 1000, self.cfg.cache_minutes))
-                .map(|c| (s, c.skin()))
-        })
+        let &first = sources.first()?;
+        self.cache
+            .get(first, name)
+            .filter(|c| !c.is_expired(now / 1000, self.cfg.cache_minutes))
+            .map(|c| (first, c.skin()))
     }
 }
 
@@ -260,7 +270,7 @@ fn on_login(player: &Player) {
     let has_own_skin = player.get_skin().is_some_and(|s| !s.value.is_empty());
     let now = now_ms();
     let apply = with_state(|s| {
-        let (key, record) = s.record(&name, &uuid);
+        let (key, record, mut changed) = s.record(&name, &uuid);
         let record = record.clone();
         let plan = plan_login(
             Some(&record),
@@ -275,32 +285,36 @@ fn on_login(player: &Player) {
                 r.choice = Choice::Auto;
             }
             s.ops.bump(&key);
+            changed = true;
         }
-        s.save_players();
+        if changed {
+            s.save_players();
+        }
         if let Some(wanted) = plan.lookup {
             let dedupe = format!("{}|{:?}", wanted.name, wanted.sources);
-            if s.login_lookups.insert(dedupe.clone()) {
-                match s.engine.submit(&wanted.name, &wanted.sources, now) {
-                    Ok(q) => {
-                        let applied = match &plan.apply {
-                            Apply::Skin(skin) => Some(skin.value.clone()),
-                            Apply::Steve | Apply::Keep => None,
-                        };
-                        s.purposes.insert(
-                            q,
-                            Purpose::Login {
-                                player: id,
-                                dedupe,
-                                applied,
-                            },
-                        );
-                    }
-                    // Busy: the stored skin stays in use; the next login tries again.
-                    Err(_) => {
-                        s.login_lookups.remove(&dedupe);
-                    }
-                }
+            let applied = match &plan.apply {
+                Apply::Skin(skin) => skin_url(&skin.value),
+                Apply::Steve | Apply::Keep => None,
+            };
+            let running = s.login_lookups.get(&dedupe).copied();
+            if let Some(Purpose::Login { waiters, .. }) =
+                running.and_then(|q| s.purposes.get_mut(&q))
+            {
+                // Same lookup already running: wait for it too. A rejoining player
+                // replaces their earlier entry.
+                waiters.retain(|(waiting, _)| wit_uuid::to_string(*waiting) != uuid);
+                waiters.push((id, applied));
+            } else if let Ok(q) = s.engine.submit(&wanted.name, &wanted.sources, now) {
+                s.login_lookups.insert(dedupe.clone(), q);
+                s.purposes.insert(
+                    q,
+                    Purpose::Login {
+                        dedupe,
+                        waiters: vec![(id, applied)],
+                    },
+                );
             }
+            // Busy: the stored skin stays in use; the next login tries again.
         }
         plan.apply
     });
@@ -385,7 +399,7 @@ fn finish(
                     fetched_at: now / 1000,
                 },
             );
-            s.save_cache();
+            s.cache_dirty = true;
             Some((*source, name.clone(), skin.clone()))
         }
         _ => None,
@@ -441,35 +455,36 @@ fn finish(
         Purpose::Skull {
             issuer,
             recipient,
+            recipient_name,
             recipient_key,
+            name,
         } => {
             s.ops.end(&recipient_key);
             start_cooldown(s, &issuer, found.is_some(), now);
             match found {
-                Some((_, name, skin)) => {
-                    effects.push(Effect::GiveSkull {
-                        recipient,
-                        name,
-                        skin,
-                    });
-                    effects.push(Effect::Tell(issuer, "Head given.".into()));
-                }
+                Some((_, _, skin)) => effects.push(Effect::GiveSkull {
+                    issuer,
+                    recipient,
+                    recipient_name,
+                    name,
+                    skin,
+                }),
                 None => effects.push(Effect::Tell(issuer, format!("No head: {failure}."))),
             }
         }
-        Purpose::Login {
-            player,
-            dedupe,
-            applied,
-        } => {
+        Purpose::Login { dedupe, waiters } => {
             s.login_lookups.remove(&dedupe);
-            if let Some((_, _, skin)) = &found
-                && applied.as_deref() != Some(skin.value.as_str())
-            {
-                effects.push(Effect::TellPlayer(
-                    player,
-                    "Your skin is ready, rejoin to see it.".into(),
-                ));
+            if let Some((_, _, skin)) = &found {
+                // Compared by URL: the textures value carries a fresh timestamp.
+                let url = skin_url(&skin.value);
+                for (player, applied) in waiters {
+                    if applied.is_none() || applied != url {
+                        effects.push(Effect::TellPlayer(
+                            player,
+                            "Your skin is ready, rejoin to see it.".into(),
+                        ));
+                    }
+                }
             }
         }
     }
@@ -483,24 +498,41 @@ async fn give_skull(player: &Player, name: &str, skin: &SkinData) {
     player.get_inventory().give_item(head, true).await;
 }
 
+fn tell_player(server: &ServerInstance, id: Uuid, msg: &str) {
+    if let Some(p) = server.get_player_by_uuid(id) {
+        p.send_system_message(text(msg), false);
+    }
+}
+
+fn tell(server: &ServerInstance, issuer: &Issuer, msg: &str) {
+    match issuer {
+        Issuer::Console => log(Level::Info, msg),
+        Issuer::Player { id, .. } => tell_player(server, *id, msg),
+    }
+}
+
 async fn run_effects(server: &ServerInstance, effects: Vec<Effect>) {
     for effect in effects {
         match effect {
-            Effect::Tell(Issuer::Console, msg) => log(Level::Info, &msg),
-            Effect::Tell(Issuer::Player { id, .. }, msg) | Effect::TellPlayer(id, msg) => {
-                if let Some(p) = server.get_player_by_uuid(id) {
-                    p.send_system_message(text(&msg), false);
-                }
-            }
+            Effect::Tell(issuer, msg) => tell(server, &issuer, &msg),
+            Effect::TellPlayer(id, msg) => tell_player(server, id, &msg),
             Effect::GiveSkull {
+                issuer,
                 recipient,
+                recipient_name,
                 name,
                 skin,
-            } => {
-                if let Some(p) = server.get_player_by_uuid(recipient) {
+            } => match server.get_player_by_uuid(recipient) {
+                Some(p) => {
                     give_skull(&p, &name, &skin).await;
+                    tell(server, &issuer, "Head given.");
                 }
-            }
+                None => tell(
+                    server,
+                    &issuer,
+                    &format!("Head not given: {recipient_name} left."),
+                ),
+            },
         }
     }
 }
@@ -530,6 +562,9 @@ async fn tick(server: &ServerInstance) {
             if let Some(purpose) = s.purposes.remove(&q) {
                 effects.extend(finish(s, server, purpose, outcome, now));
             }
+        }
+        if std::mem::take(&mut s.cache_dirty) {
+            s.save_cache();
         }
         effects
     })
@@ -566,7 +601,7 @@ fn sender_of(s: &mut State, sender: &CommandSender) -> Sender {
     match sender.as_player() {
         Some(p) => {
             let uuid = uuid_string(p.get_id());
-            let (key, _) = s.record(&p.get_name(), &uuid);
+            let (key, _, _) = s.record(&p.get_name(), &uuid);
             Sender {
                 issuer: Issuer::Player {
                     id: p.get_id(),
@@ -585,8 +620,6 @@ fn sender_of(s: &mut State, sender: &CommandSender) -> Sender {
     }
 }
 
-/// Cooldown and pending guard, then either an immediate result from a fresh cache entry
-/// or a lookup. Returns the reply.
 /// Cooldown of the issuing player (admins exempt) and the target's pending lookup.
 fn guard(s: &State, who: &Sender, pending_key: &str, now: u64) -> Result<(), String> {
     if !who.admin
@@ -601,6 +634,7 @@ fn guard(s: &State, who: &Sender, pending_key: &str, now: u64) -> Result<(), Str
     Ok(())
 }
 
+/// Cooldown and pending guard, then a lookup that ends in `purpose`.
 fn start_lookup(
     s: &mut State,
     who: &Sender,
@@ -655,28 +689,51 @@ fn describe(s: &State, record: &PlayerRecord, now: u64) -> String {
     format!("{}: {label}, {age}{lock}.", record.name)
 }
 
+/// The text of `config.toml`. A missing file is recreated from the defaults, which the
+/// flag reports.
+fn config_text() -> Result<(String, bool), String> {
+    match read_file(CONFIG_PATH)? {
+        Some(t) => Ok((t, false)),
+        None => {
+            write_atomic(CONFIG_PATH, DEFAULT_CONFIG)?;
+            Ok((DEFAULT_CONFIG.to_string(), true))
+        }
+    }
+}
+
+fn recreated_note(recreated: bool, reply: String) -> String {
+    if recreated {
+        format!("config.toml was missing; recreated with defaults. {reply}")
+    } else {
+        reply
+    }
+}
+
 fn edit_block_list(s: &mut State, entry: &str, add: bool) -> Result<String, String> {
-    let current = read_file(CONFIG_PATH)?.unwrap_or_else(|| DEFAULT_CONFIG.to_string());
+    let (current, recreated) = config_text()?;
+    if recreated {
+        s.cfg = config::parse(&current)?;
+    }
     let edited = if add {
         config::add_blocked(&current, entry)?
     } else {
         config::remove_blocked(&current, entry)?
     };
-    let Some(edited) = edited else {
-        return Ok(if add {
-            format!("{entry} was already blocked.")
-        } else {
-            format!("{entry} was not blocked.")
-        });
+    let reply = match edited {
+        Some(edited) => {
+            let cfg = config::parse(&edited)?;
+            write_atomic(CONFIG_PATH, &edited)?;
+            s.cfg = cfg;
+            if add {
+                format!("Blocked {entry}.")
+            } else {
+                format!("Unblocked {entry}.")
+            }
+        }
+        None if add => format!("{entry} was already blocked."),
+        None => format!("{entry} was not blocked."),
     };
-    let cfg = config::parse(&edited)?;
-    write_atomic(CONFIG_PATH, &edited)?;
-    s.cfg = cfg;
-    Ok(if add {
-        format!("Blocked {entry}.")
-    } else {
-        format!("Unblocked {entry}.")
-    })
+    Ok(recreated_note(recreated, reply))
 }
 
 /// Runs `/skin`; returns the reply.
@@ -693,9 +750,12 @@ fn run_skin(
     }
     let target_of = |s: &mut State, target: Option<&str>| -> Result<(String, bool), String> {
         let p = resolve_target(server, who.player.as_ref(), target)?;
-        let (key, _) = s.record(&p.get_name(), &uuid_string(p.get_id()));
+        let (key, _, _) = s.record(&p.get_name(), &uuid_string(p.get_id()));
         Ok((key, target.is_none()))
     };
+    if matches!(cmd, SkinCmd::History | SkinCmd::Undo) && who.player.is_none() {
+        return Err("This command is for players.".into());
+    }
     let reply = match cmd {
         SkinCmd::Help => format!("Usage: {SKIN_USAGE}"),
         SkinCmd::Set { spec, target } => {
@@ -768,9 +828,9 @@ fn run_skin(
         SkinCmd::Block(source, name) => edit_block_list(s, &skin_key(source, &name), true)?,
         SkinCmd::Unblock(source, name) => edit_block_list(s, &skin_key(source, &name), false)?,
         SkinCmd::Reload => {
-            let text = read_file(CONFIG_PATH)?.unwrap_or_else(|| DEFAULT_CONFIG.to_string());
+            let (text, recreated) = config_text()?;
             s.cfg = config::parse(&text)?;
-            "Config reloaded.".into()
+            recreated_note(recreated, "Config reloaded.".into())
         }
     };
     Ok(reply)
@@ -837,7 +897,8 @@ async fn handle_skull(sender: &CommandSender, server: &ServerInstance, raw: &str
             return Err("You are not allowed to give heads to others.".into());
         }
         let recipient = resolve_target(server, who.player.as_ref(), target.as_deref())?;
-        let (recipient_key, _) = s.record(&recipient.get_name(), &uuid_string(recipient.get_id()));
+        let recipient_name = recipient.get_name();
+        let (recipient_key, _, _) = s.record(&recipient_name, &uuid_string(recipient.get_id()));
         let sources = s.sources_for(spec.source, &spec.name);
         if let Some((_, skin)) = s.fresh_cached(&sources, &spec.name, now) {
             guard(s, &who, &recipient_key, now)?;
@@ -850,7 +911,9 @@ async fn handle_skull(sender: &CommandSender, server: &ServerInstance, raw: &str
         let purpose = Purpose::Skull {
             issuer: who.issuer.clone(),
             recipient: recipient.get_id(),
+            recipient_name,
             recipient_key: recipient_key.clone(),
+            name: spec.name.clone(),
         };
         start_lookup(s, &who, &recipient_key, &spec.name, &sources, purpose, now)?;
         Ok((format!("Looking up {}...", spec.name), None))
@@ -876,7 +939,14 @@ fn lock_command(
     let p = server
         .get_player_by_name(name)
         .ok_or_else(|| format!("{name} is not online."))?;
-    let (key, record) = s.record(&p.get_name(), &uuid_string(p.get_id()));
+    let (key, record, _) = s.record(&p.get_name(), &uuid_string(p.get_id()));
+    if record.locked == lock {
+        return Ok(if lock {
+            format!("{name} is already locked.")
+        } else {
+            format!("{name} is already unlocked.")
+        });
+    }
     record.locked = lock;
     s.ops.bump(&key);
     s.save_players();
@@ -891,13 +961,7 @@ fn lock_command(
 
 fn load_state(online_mode: bool) -> Result<State, String> {
     let _ = fs::create_dir_all("data");
-    let config_text = match read_file(CONFIG_PATH)? {
-        Some(t) => t,
-        None => {
-            write_atomic(CONFIG_PATH, DEFAULT_CONFIG)?;
-            DEFAULT_CONFIG.to_string()
-        }
-    };
+    let (config_text, _) = config_text()?;
     let cfg = config::parse(&config_text)?;
     let players: Players = store::load(read_file(PLAYERS_PATH)?.as_deref())
         .map_err(|e| format!("{PLAYERS_PATH}: {e}"))?;
@@ -913,7 +977,8 @@ fn load_state(online_mode: bool) -> Result<State, String> {
         purposes: HashMap::new(),
         ops: Ops::default(),
         cooldowns: Cooldowns::default(),
-        login_lookups: HashSet::new(),
+        login_lookups: HashMap::new(),
+        cache_dirty: false,
     })
 }
 

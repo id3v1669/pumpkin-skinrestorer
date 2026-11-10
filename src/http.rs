@@ -43,8 +43,9 @@ impl Request {
         let fields = wasi::http::types::Fields::new();
         header(&fields, "user-agent", USER_AGENT)?;
         header(&fields, "accept", b"application/json")?;
-        if req.body.is_some() {
+        if let Some(body) = &req.body {
             header(&fields, "content-type", b"application/json")?;
+            header(&fields, "content-length", body.len().to_string().as_bytes())?;
         }
         let outgoing = OutgoingRequest::new(fields);
         let method = match req.method {
@@ -132,23 +133,29 @@ impl Request {
             self.response = Some(response);
         }
         let stream = self.stream.as_ref()?;
-        if !stream.subscribe().ready() {
-            return None;
-        }
-        match stream.read(8192) {
-            Ok(chunk) => {
-                self.bytes.extend_from_slice(&chunk);
-                if self.bytes.len() > MAX_BODY {
-                    return Some(Err("response too large".into()));
-                }
-                None
+        // Read everything that is ready, so the end of the body is seen in the same tick.
+        loop {
+            if !stream.subscribe().ready() {
+                return None;
             }
-            Err(StreamError::Closed) => Some(Ok(HttpResponse {
-                status: self.status,
-                retry_after: self.retry_after,
-                body: std::mem::take(&mut self.bytes),
-            })),
-            Err(e) => Some(Err(format!("reading response: {e:?}"))),
+            match stream.read(8192) {
+                // Ready without data: ask again next tick rather than spin.
+                Ok(chunk) if chunk.is_empty() => return None,
+                Ok(chunk) => {
+                    self.bytes.extend_from_slice(&chunk);
+                    if self.bytes.len() > MAX_BODY {
+                        return Some(Err("response too large".into()));
+                    }
+                }
+                Err(StreamError::Closed) => {
+                    return Some(Ok(HttpResponse {
+                        status: self.status,
+                        retry_after: self.retry_after,
+                        body: std::mem::take(&mut self.bytes),
+                    }));
+                }
+                Err(e) => return Some(Err(format!("reading response: {e:?}"))),
+            }
         }
     }
 }
