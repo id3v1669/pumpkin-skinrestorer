@@ -120,15 +120,24 @@ fn valid_uuid(id: &str) -> bool {
     }
 }
 
-/// Parses a bulk lookup answer into `(lowercase name, uuid)` pairs. Names that were not
-/// found are simply absent; entries with a malformed id or name are dropped.
+/// A valid UUID in Mojang's undashed form: 32 lowercase hex digits.
+fn normal_uuid(id: &str) -> String {
+    id.chars()
+        .filter(|c| *c != '-')
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// Parses a bulk lookup answer into `(lowercase name, undashed lowercase uuid)` pairs.
+/// Names that were not found are simply absent; entries with a malformed id or name are
+/// dropped.
 pub fn parse_uuid_batch(body: &[u8]) -> Result<Vec<(String, String)>, String> {
     let found: Vec<IdName> =
         serde_json::from_slice(body).map_err(|e| format!("bad name lookup answer: {e}"))?;
     Ok(found
         .into_iter()
         .filter(|p| valid_uuid(&p.id) && valid_name(&p.name))
-        .map(|p| (p.name.to_ascii_lowercase(), p.id))
+        .map(|p| (p.name.to_ascii_lowercase(), normal_uuid(&p.id)))
         .collect())
 }
 
@@ -259,7 +268,7 @@ mod tests {
         let body = br#"[
             {"id":"../x?y","name":"evil"},
             {"id":"069a79f444e94726a5befca90e38aaf5","name":"Notch"},
-            {"id":"853c80ef-3c37-49fd-aa49-938b674adae6","name":"jeb_"},
+            {"id":"853C80EF-3C37-49FD-AA49-938B674ADAE6","name":"jeb_"},
             {"id":"61699b2ed3274a019f1e0ea8c3f06bc6","name":"../etc"},
             {"id":"069a79f444e94726a5befca90e38aaf","name":"short"},
             {"id":"853c80ef3c37-49fd-aa49-938b674adae6-","name":"shifted"}
@@ -268,7 +277,7 @@ mod tests {
             parse_uuid_batch(body).unwrap(),
             vec![
                 ("notch".into(), "069a79f444e94726a5befca90e38aaf5".into()),
-                ("jeb_".into(), "853c80ef-3c37-49fd-aa49-938b674adae6".into()),
+                ("jeb_".into(), "853c80ef3c3749fdaa49938b674adae6".into()),
             ]
         );
     }
