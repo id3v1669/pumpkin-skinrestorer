@@ -4,3 +4,4 @@
 pub mod config;
 pub mod skin;
 pub mod source;
+pub mod store;
