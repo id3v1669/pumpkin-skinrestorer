@@ -90,16 +90,22 @@ impl Engine {
         self.keys.len()
     }
 
-    /// Starts looking up `name` in `sources`, in order, until one has a skin.
+    /// Starts looking up `name` in `sources`, in order, until one has a skin. `Busy` when
+    /// the queue is full and none of the sources already has a lookup for this name.
     pub fn submit(&mut self, name: &str, sources: &[Source], now: u64) -> Result<QueryId, Busy> {
-        if self.keys.len() >= MAX_QUEUED {
+        let name = name.to_ascii_lowercase();
+        if self.keys.len() >= MAX_QUEUED
+            && !sources
+                .iter()
+                .any(|&s| self.keys.contains_key(&(s, name.clone())))
+        {
             return Err(Busy);
         }
         let id = self.id();
         self.queries.insert(
             id,
             Query {
-                name: name.to_ascii_lowercase(),
+                name,
                 remaining: sources.iter().copied().collect(),
                 errors: Vec::new(),
             },
@@ -133,30 +139,37 @@ impl Engine {
                 self.finished.push((id, outcome));
                 return;
             };
+            let key = (source, query.name.clone());
+            // A lookup that is already queued or running is joined, whatever its stage.
+            if let Some(state) = self.keys.get_mut(&key) {
+                state.waiters.push(id);
+                return;
+            }
+            // Only starting a new lookup is refused on a paused source or a full queue.
             if self.backoff_until.get(&source).is_some_and(|&t| now < t) {
                 query
                     .errors
                     .push(format!("{} is rate limited", source.as_str()));
                 continue;
             }
-            let key = (source, query.name.clone());
-            match self.keys.get_mut(&key) {
-                Some(state) => state.waiters.push(id),
-                None => {
-                    self.keys.insert(
-                        key.clone(),
-                        KeyState {
-                            stage: Stage::WantUuid,
-                            waiters: vec![id],
-                        },
-                    );
-                    let entry = self.pending.entry(source).or_insert((now, Vec::new()));
-                    if entry.1.is_empty() {
-                        entry.0 = now;
-                    }
-                    entry.1.push(key);
+            if self.keys.len() >= MAX_QUEUED {
+                if !query.errors.iter().any(|e| e == "busy") {
+                    query.errors.push("busy".into());
                 }
+                continue;
             }
+            self.keys.insert(
+                key.clone(),
+                KeyState {
+                    stage: Stage::WantUuid,
+                    waiters: vec![id],
+                },
+            );
+            let entry = self.pending.entry(source).or_insert((now, Vec::new()));
+            if entry.1.is_empty() {
+                entry.0 = now;
+            }
+            entry.1.push(key);
             return;
         }
     }
@@ -264,7 +277,10 @@ impl Engine {
 
     fn note_rate_limit(&mut self, source: Source, response: &HttpResponse, now: u64) {
         let secs = response.retry_after.unwrap_or(DEFAULT_BACKOFF_SECS);
-        self.backoff_until.insert(source, now + secs * 1000);
+        // Never shortens a pause that is already running.
+        let until = now.saturating_add(secs.saturating_mul(1000));
+        let e = self.backoff_until.entry(source).or_insert(0);
+        *e = (*e).max(until);
     }
 
     /// Feeds back the result of a request from [`Engine::poll_requests`].
@@ -446,6 +462,7 @@ mod tests {
         let reqs = e.poll_requests(1000);
         e.on_response(reqs[0].0, status(204, None), 1000);
         assert_eq!(e.take_finished()[0].1, Outcome::NotFound);
+        assert_eq!(e.queued(), 0);
     }
 
     #[test]
@@ -493,6 +510,7 @@ mod tests {
             e.take_finished()[0].1,
             Outcome::Failed("mojang: timed out".into())
         );
+        assert_eq!(e.queued(), 0);
     }
 
     #[test]
@@ -512,6 +530,7 @@ mod tests {
             1000,
         );
         assert_eq!(e.take_finished()[0].1, Outcome::NotFound);
+        assert_eq!(e.queued(), 0);
     }
 
     #[test]
@@ -534,5 +553,327 @@ mod tests {
             total += e.poll_requests(0).len();
         }
         assert_eq!(total, MAX_IN_FLIGHT);
+    }
+
+    /// A distinct, valid uuid per name, so Mojang skin requests can be told apart.
+    fn uuid_for(name: &str) -> String {
+        let hex: String = name.bytes().map(|b| format!("{b:02x}")).collect();
+        format!("{hex:0>32}")
+    }
+
+    /// A bulk lookup answer that knows `names`.
+    fn ids(names: &[&str]) -> String {
+        let entries: Vec<String> = names
+            .iter()
+            .map(|n| format!(r#"{{"id":"{}","name":"{n}"}}"#, uuid_for(n)))
+            .collect();
+        format!("[{}]", entries.join(","))
+    }
+
+    fn skin_req_for(reqs: &[(ReqId, HttpRequest)], name: &str) -> ReqId {
+        reqs.iter()
+            .find(|(_, r)| r.method == Method::Get && r.path.contains(&uuid_for(name)))
+            .expect("skin request exists")
+            .0
+    }
+
+    #[test]
+    fn a_shorter_retry_after_never_shortens_the_pause() {
+        let mut e = Engine::new();
+        e.submit("a", &[Source::Mojang], 0).unwrap();
+        let batch = e.poll_requests(1000);
+        e.on_response(batch[0].0, ok(&ids(&["a"])), 1000);
+        let skin = e.poll_requests(1000);
+        assert_eq!(skin.len(), 1);
+        e.submit("b", &[Source::Mojang], 1000).unwrap();
+        let batch = e.poll_requests(2000);
+        assert_eq!(batch.len(), 1);
+        e.on_response(batch[0].0, status(429, Some(60)), 2000);
+        e.on_response(skin[0].0, status(429, Some(1)), 2100);
+        assert_eq!(e.take_finished().len(), 2);
+        e.submit("c", &[Source::Mojang], 4000).unwrap();
+        assert!(e.poll_requests(5000).is_empty());
+        assert_eq!(
+            e.take_finished()[0].1,
+            Outcome::Failed("mojang is rate limited".into())
+        );
+        assert_eq!(e.queued(), 0);
+    }
+
+    #[test]
+    fn huge_retry_after_does_not_overflow() {
+        let mut e = Engine::new();
+        e.submit("a", &[Source::Mojang], 0).unwrap();
+        let reqs = e.poll_requests(1000);
+        e.on_response(reqs[0].0, status(429, Some(u64::MAX)), 1000);
+        assert_eq!(
+            e.take_finished()[0].1,
+            Outcome::Failed("mojang: rate limited".into())
+        );
+        e.submit("b", &[Source::Mojang], u64::MAX - 1).unwrap();
+        assert!(matches!(e.take_finished()[0].1, Outcome::Failed(_)));
+        assert_eq!(e.queued(), 0);
+    }
+
+    #[test]
+    fn paused_source_still_joins_an_in_flight_key() {
+        let mut e = Engine::new();
+        e.submit("a", &[Source::Mojang], 0).unwrap();
+        e.submit("b", &[Source::Mojang], 0).unwrap();
+        let batch = e.poll_requests(1000);
+        e.on_response(batch[0].0, ok(&ids(&["a", "b"])), 1000);
+        let skins = e.poll_requests(1000);
+        assert_eq!(skins.len(), 2);
+        e.on_response(skin_req_for(&skins, "b"), status(429, None), 1000);
+        assert_eq!(
+            e.take_finished()[0].1,
+            Outcome::Failed("mojang: rate limited".into())
+        );
+        // Mojang is paused, but the lookup for "a" is already running: join it.
+        e.submit("A", &[Source::Mojang], 1100).unwrap();
+        assert!(e.take_finished().is_empty());
+        assert_eq!(e.queued(), 1);
+        e.on_response(skin_req_for(&skins, "a"), ok(&profile_body()), 1200);
+        let done = e.take_finished();
+        assert_eq!(done.len(), 2);
+        assert!(done.iter().all(|(_, o)| matches!(o, Outcome::Found { .. })));
+        assert_eq!(e.queued(), 0);
+    }
+
+    #[test]
+    fn full_queue_still_accepts_a_queued_name() {
+        let mut e = Engine::new();
+        for i in 0..MAX_QUEUED {
+            e.submit(&format!("p{i}"), &[Source::Mojang], 0).unwrap();
+        }
+        assert!(e.submit("P0", &[Source::Mojang], 0).is_ok());
+        assert_eq!(e.queued(), MAX_QUEUED);
+        assert_eq!(e.submit("one_more", &[Source::Mojang], 0), Err(Busy));
+        assert!(e.take_finished().is_empty());
+    }
+
+    #[test]
+    fn full_queue_skips_sources_that_need_a_new_key() {
+        let mut e = Engine::new();
+        for i in 0..MAX_QUEUED {
+            e.submit(&format!("p{i}"), &[Source::Mojang], 0).unwrap();
+        }
+        // Ely.by would need a new key, Mojang already has one for this name.
+        let q = e.submit("p0", &[Source::Ely, Source::Mojang], 0).unwrap();
+        assert_eq!(e.queued(), MAX_QUEUED);
+        let reqs = e.poll_requests(0);
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].1.host, "api.minecraftservices.com");
+        e.on_response(reqs[0].0, ok("[]"), 0);
+        let done = e.take_finished();
+        assert_eq!(done.len(), BATCH_SIZE + 1);
+        let busy: Vec<_> = done.iter().filter(|(id, _)| *id == q).collect();
+        assert_eq!(busy.len(), 1);
+        assert_eq!(busy[0].1, Outcome::Failed("busy".into()));
+        assert_eq!(e.queued(), MAX_QUEUED - BATCH_SIZE);
+    }
+
+    #[test]
+    fn same_name_joins_while_the_name_lookup_is_in_flight() {
+        let mut e = Engine::new();
+        e.submit("a", &[Source::Mojang], 0).unwrap();
+        let batch = e.poll_requests(1000);
+        e.submit("A", &[Source::Mojang], 1000).unwrap();
+        assert_eq!(e.queued(), 1);
+        assert!(e.poll_requests(3000).is_empty());
+        e.on_response(batch[0].0, ok(&ids(&["a"])), 3000);
+        let skins = e.poll_requests(3000);
+        assert_eq!(skins.len(), 1);
+        e.on_response(skins[0].0, ok(&profile_body()), 3000);
+        assert_eq!(e.take_finished().len(), 2);
+        assert_eq!(e.queued(), 0);
+    }
+
+    #[test]
+    fn same_name_joins_while_waiting_for_the_skin_request() {
+        let mut e = Engine::new();
+        e.submit("a", &[Source::Mojang], 0).unwrap();
+        let batch = e.poll_requests(1000);
+        e.on_response(batch[0].0, ok(&ids(&["a"])), 1000);
+        e.submit("A", &[Source::Mojang], 1000).unwrap();
+        assert_eq!(e.queued(), 1);
+        let skins = e.poll_requests(1000);
+        assert_eq!(skins.len(), 1);
+        e.on_response(skins[0].0, ok(&profile_body()), 1000);
+        assert_eq!(e.take_finished().len(), 2);
+        assert_eq!(e.queued(), 0);
+    }
+
+    #[test]
+    fn skin_rate_limit_without_retry_after_uses_the_default_pause() {
+        let mut e = Engine::new();
+        e.submit("a", &[Source::Mojang], 0).unwrap();
+        let batch = e.poll_requests(1000);
+        e.on_response(batch[0].0, ok(&ids(&["a"])), 1000);
+        let skins = e.poll_requests(1000);
+        e.on_response(skins[0].0, status(429, None), 1000);
+        assert_eq!(
+            e.take_finished()[0].1,
+            Outcome::Failed("mojang: rate limited".into())
+        );
+        assert_eq!(e.queued(), 0);
+        let end = 1000 + DEFAULT_BACKOFF_SECS * 1000;
+        e.submit("b", &[Source::Mojang], end - 1).unwrap();
+        assert_eq!(
+            e.take_finished()[0].1,
+            Outcome::Failed("mojang is rate limited".into())
+        );
+        e.submit("b", &[Source::Mojang], end).unwrap();
+        assert!(e.take_finished().is_empty());
+        assert_eq!(e.poll_requests(end + BATCH_WINDOW_MS).len(), 1);
+    }
+
+    #[test]
+    fn pending_batch_on_a_paused_source_fails() {
+        let mut e = Engine::new();
+        e.submit("a", &[Source::Mojang], 0).unwrap();
+        let batch = e.poll_requests(1000);
+        e.submit("b", &[Source::Mojang], 1000).unwrap();
+        e.on_response(batch[0].0, status(429, Some(30)), 1500);
+        assert_eq!(e.take_finished().len(), 1);
+        assert!(e.poll_requests(2000).is_empty());
+        assert_eq!(
+            e.take_finished()[0].1,
+            Outcome::Failed("mojang: rate limited".into())
+        );
+        assert_eq!(e.queued(), 0);
+    }
+
+    #[test]
+    fn key_waiting_for_its_skin_on_a_paused_source_fails() {
+        let mut e = Engine::new();
+        e.submit("a", &[Source::Mojang], 0).unwrap();
+        let first = e.poll_requests(1000);
+        e.submit("b", &[Source::Mojang], 1000).unwrap();
+        let second = e.poll_requests(2000);
+        assert_eq!(second.len(), 1);
+        e.on_response(first[0].0, ok(&ids(&["a"])), 2000);
+        e.on_response(second[0].0, status(429, Some(30)), 2000);
+        assert_eq!(e.take_finished().len(), 1);
+        assert!(e.poll_requests(2000).is_empty());
+        assert_eq!(
+            e.take_finished()[0].1,
+            Outcome::Failed("mojang: rate limited".into())
+        );
+        assert_eq!(e.queued(), 0);
+    }
+
+    #[test]
+    fn more_names_than_a_batch_go_out_in_two_requests() {
+        let mut e = Engine::new();
+        for i in 0..=BATCH_SIZE {
+            e.submit(&format!("p{i}"), &[Source::Mojang], 0).unwrap();
+        }
+        let names = |reqs: &[(ReqId, HttpRequest)]| -> Vec<String> {
+            serde_json::from_slice(reqs[0].1.body.as_ref().unwrap()).unwrap()
+        };
+        let first = e.poll_requests(0);
+        assert_eq!(first.len(), 1);
+        assert_eq!(names(&first).len(), BATCH_SIZE);
+        assert!(e.poll_requests(0).is_empty());
+        let second = e.poll_requests(BATCH_WINDOW_MS);
+        assert_eq!(second.len(), 1);
+        assert_eq!(names(&second), vec![format!("p{BATCH_SIZE}")]);
+    }
+
+    #[test]
+    fn names_missing_from_a_batch_answer_move_on() {
+        let mut e = Engine::new();
+        e.submit("a", &[Source::Ely, Source::Mojang], 0).unwrap();
+        e.submit("b", &[Source::Ely], 0).unwrap();
+        let c = e.submit("c", &[Source::Ely], 0).unwrap();
+        let batch = e.poll_requests(1000);
+        assert_eq!(batch.len(), 1);
+        e.on_response(batch[0].0, ok(&ids(&["b"])), 1000);
+        // "c" has no other source, "a" moves to Mojang, "b" gets its skin request.
+        assert_eq!(e.take_finished(), vec![(c, Outcome::NotFound)]);
+        let reqs = e.poll_requests(2000);
+        assert_eq!(reqs.len(), 2);
+        let mojang = reqs
+            .iter()
+            .find(|(_, r)| r.host == "api.minecraftservices.com")
+            .expect("name lookup at Mojang");
+        let names: Vec<String> = serde_json::from_slice(mojang.1.body.as_ref().unwrap()).unwrap();
+        assert_eq!(names, vec!["a".to_string()]);
+        assert!(
+            reqs.iter()
+                .any(|(_, r)| r.host == "skinsystem.ely.by" && r.path.ends_with("/b"))
+        );
+    }
+
+    #[test]
+    fn a_response_frees_an_in_flight_slot() {
+        let mut e = Engine::new();
+        for i in 0..(BATCH_SIZE * (MAX_IN_FLIGHT + 1)) {
+            e.submit(&format!("p{i}"), &[Source::Mojang], 0).unwrap();
+        }
+        let mut sent = Vec::new();
+        for _ in 0..(MAX_IN_FLIGHT + 1) {
+            sent.extend(e.poll_requests(0));
+        }
+        assert_eq!(sent.len(), MAX_IN_FLIGHT);
+        e.on_response(sent[0].0, ok("[]"), 0);
+        assert_eq!(e.poll_requests(0).len(), 1);
+    }
+
+    #[test]
+    fn unknown_request_id_is_ignored() {
+        let mut e = Engine::new();
+        e.on_response(999, ok("[]"), 0);
+        e.submit("a", &[Source::Mojang], 0).unwrap();
+        let reqs = e.poll_requests(1000);
+        e.on_response(reqs[0].0 + 1000, ok("[]"), 1000);
+        assert!(e.take_finished().is_empty());
+        assert_eq!(e.queued(), 1);
+    }
+
+    #[test]
+    fn server_error_is_reported() {
+        let mut e = Engine::new();
+        e.submit("a", &[Source::Mojang], 0).unwrap();
+        let reqs = e.poll_requests(1000);
+        e.on_response(reqs[0].0, status(500, None), 1000);
+        assert_eq!(
+            e.take_finished()[0].1,
+            Outcome::Failed("mojang: HTTP 500".into())
+        );
+        assert_eq!(e.queued(), 0);
+    }
+
+    #[test]
+    fn malformed_answers_are_reported() {
+        let mut e = Engine::new();
+        e.submit("a", &[Source::Mojang], 0).unwrap();
+        let reqs = e.poll_requests(1000);
+        e.on_response(reqs[0].0, ok("not json"), 1000);
+        match &e.take_finished()[0].1 {
+            Outcome::Failed(msg) => assert!(msg.starts_with("mojang: bad name lookup answer")),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(e.queued(), 0);
+
+        e.submit("a", &[Source::Mojang], 2000).unwrap();
+        let reqs = e.poll_requests(3000);
+        e.on_response(reqs[0].0, ok(&ids(&["a"])), 3000);
+        let reqs = e.poll_requests(3000);
+        e.on_response(reqs[0].0, ok("not json"), 3000);
+        match &e.take_finished()[0].1 {
+            Outcome::Failed(msg) => assert!(msg.starts_with("mojang: bad profile answer")),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(e.queued(), 0);
+    }
+
+    #[test]
+    fn no_sources_is_not_found_at_once() {
+        let mut e = Engine::new();
+        let q = e.submit("a", &[], 0).unwrap();
+        assert_eq!(e.take_finished(), vec![(q, Outcome::NotFound)]);
+        assert_eq!(e.queued(), 0);
     }
 }
