@@ -63,10 +63,14 @@ pub const SKULL_USAGE: &str = "/skull [ely:|mojang:]<name> [player]";
 /// `ely:Notch`, `mojang:Notch` or `Notch`.
 pub fn parse_spec(arg: &str) -> Result<SkinSpec, String> {
     let (source, name) = match arg.split_once(':') {
-        Some((s, n)) => (
-            Some(Source::parse(s).ok_or_else(|| format!("unknown source `{s}`"))?),
-            n,
-        ),
+        Some(("", _)) => return Err("missing source before `:`".to_string()),
+        Some((s, n)) => {
+            let source = Source::parse(s).ok_or_else(|| format!("unknown source `{s}`"))?;
+            if n.is_empty() {
+                return Err(format!("missing account name after `{s}:`"));
+            }
+            (Some(source), n)
+        }
         None => (None, arg),
     };
     if !valid_name(name) {
@@ -90,8 +94,16 @@ fn optional_player(arg: Option<&str>) -> Result<Option<String>, String> {
     arg.map(player).transpose()
 }
 
+/// `/skin <subcommand> ...`; the subcommand is matched case-insensitively.
 pub fn parse_skin(args: &str) -> Result<SkinCmd, String> {
-    let words: Vec<&str> = args.split_whitespace().collect();
+    let subcommand = args
+        .split_whitespace()
+        .next()
+        .map(|word| word.to_ascii_lowercase());
+    let mut words: Vec<&str> = args.split_whitespace().collect();
+    if let Some(subcommand) = &subcommand {
+        words[0] = subcommand;
+    }
     let usage = || format!("usage: {SKIN_USAGE}");
     let cmd = match words.as_slice() {
         [] | ["help"] => SkinCmd::Help,
@@ -131,6 +143,8 @@ pub fn parse_skin(args: &str) -> Result<SkinCmd, String> {
 }
 
 /// `/skull <spec> [player]`.
+///
+/// The caller must require admin when a target player is given.
 pub fn parse_skull(args: &str) -> Result<(SkinSpec, Option<String>), String> {
     match args.split_whitespace().collect::<Vec<_>>().as_slice() {
         [spec] => Ok((parse_spec(spec)?, None)),
@@ -208,5 +222,131 @@ mod tests {
         assert_eq!((spec.source, target), (Some(Source::Ely), None));
         assert_eq!(parse_skull("Notch Bob").unwrap().1, Some("Bob".into()));
         assert!(parse_skull("").is_err());
+    }
+
+    #[test]
+    fn needs_admin_covers_every_form() {
+        let admin = [
+            "set Notch Bob",
+            "clear Bob",
+            "update Bob",
+            "status Bob",
+            "lock Bob",
+            "unlock Bob",
+            "block ely:Notch",
+            "unblock mojang:Notch",
+            "reload",
+        ];
+        let open = [
+            "set Notch",
+            "clear",
+            "update",
+            "status",
+            "history",
+            "undo",
+            "help",
+            "",
+        ];
+        for args in admin {
+            assert!(parse_skin(args).unwrap().needs_admin(), "{args}");
+        }
+        for args in open {
+            assert!(!parse_skin(args).unwrap().needs_admin(), "{args}");
+        }
+    }
+
+    #[test]
+    fn subcommands_ignore_case() {
+        assert_eq!(
+            parse_skin("Set Notch").unwrap(),
+            SkinCmd::Set {
+                spec: SkinSpec {
+                    source: None,
+                    name: "Notch".into()
+                },
+                target: None
+            }
+        );
+        assert_eq!(parse_skin("RELOAD").unwrap(), SkinCmd::Reload);
+        assert_eq!(parse_skin("Help").unwrap(), SkinCmd::Help);
+    }
+
+    #[test]
+    fn empty_spec_parts_are_named() {
+        assert_eq!(
+            parse_spec("ely:").unwrap_err(),
+            "missing account name after `ely:`"
+        );
+        assert_eq!(
+            parse_spec(":Notch").unwrap_err(),
+            "missing source before `:`"
+        );
+    }
+
+    #[test]
+    fn remaining_subcommands_parse() {
+        assert_eq!(
+            parse_skin("update").unwrap(),
+            SkinCmd::Update { target: None }
+        );
+        assert_eq!(
+            parse_skin("update Bob").unwrap(),
+            SkinCmd::Update {
+                target: Some("Bob".into())
+            }
+        );
+        assert_eq!(parse_skin("history").unwrap(), SkinCmd::History);
+        assert_eq!(
+            parse_skin("unlock Bob").unwrap(),
+            SkinCmd::Unlock("Bob".into())
+        );
+        assert_eq!(
+            parse_skin("unblock mojang:Notch").unwrap(),
+            SkinCmd::Unblock(Source::Mojang, "notch".into())
+        );
+        assert_eq!(parse_skin("help").unwrap(), SkinCmd::Help);
+    }
+
+    #[test]
+    fn whitespace_is_tolerated() {
+        assert_eq!(
+            parse_skin("  set   Notch  ").unwrap(),
+            SkinCmd::Set {
+                spec: SkinSpec {
+                    source: None,
+                    name: "Notch".into()
+                },
+                target: None
+            }
+        );
+    }
+
+    #[test]
+    fn invalid_names_are_rejected() {
+        assert!(parse_skin("set Notch bad/name").is_err());
+        assert!(parse_skin("lock bad/name").is_err());
+        let long = "a".repeat(17);
+        assert!(parse_spec(&long).is_err());
+        assert!(parse_skin(&format!("set {long}")).is_err());
+        assert!(parse_skin(&format!("set Notch {long}")).is_err());
+        assert!(parse_skin(&format!("lock {long}")).is_err());
+        assert!(parse_spec(&"a".repeat(16)).is_ok());
+    }
+
+    #[test]
+    fn skull_rejects_extra_arguments_and_bad_specs() {
+        assert!(parse_skull("Notch Bob extra").is_err());
+        assert!(parse_skull("cdn:Notch").is_err());
+        assert!(parse_skull("bad/name").is_err());
+    }
+
+    #[test]
+    fn spec_keeps_case_and_block_lowercases() {
+        assert_eq!(parse_spec("Notch").unwrap().name, "Notch");
+        assert_eq!(parse_spec("ely:Notch").unwrap().name, "Notch");
+        assert_eq!(
+            parse_skin("block ely:Notch").unwrap(),
+            SkinCmd::Block(Source::Ely, "notch".into())
+        );
     }
 }
