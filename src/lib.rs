@@ -8,3 +8,8 @@ pub mod resolve;
 pub mod skin;
 pub mod source;
 pub mod store;
+
+#[cfg(target_family = "wasm")]
+mod http;
+#[cfg(target_family = "wasm")]
+mod plugin;
