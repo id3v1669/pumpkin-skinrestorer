@@ -2,6 +2,7 @@
 //! `plugin` and `http` are the wasm-only glue.
 
 pub mod config;
+pub mod lookup;
 pub mod skin;
 pub mod source;
 pub mod store;
