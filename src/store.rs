@@ -20,6 +20,7 @@ pub enum Choice {
 
 impl Choice {
     pub fn skin(source: Source, name: &str) -> Choice {
+        debug_assert!(crate::source::valid_name(name));
         Choice::Skin {
             source,
             name: name.to_ascii_lowercase(),
@@ -92,11 +93,11 @@ impl PlayerRecord {
         true
     }
 
-    /// Pops history entries until one is not blocked and makes it current. Pushes
-    /// nothing, so repeated undo walks further back.
+    /// Pops history entries until one is neither blocked nor the current choice and
+    /// makes it current. Pushes nothing, so repeated undo walks further back.
     pub fn undo(&mut self, is_blocked: impl Fn(&Choice) -> bool) -> Option<Choice> {
         while let Some(previous) = self.history.pop() {
-            if !is_blocked(&previous) {
+            if previous != self.choice && !is_blocked(&previous) {
                 self.choice = previous.clone();
                 return Some(previous);
             }
@@ -123,7 +124,7 @@ pub struct Players {
 pub struct CachedSkin {
     pub value: String,
     pub signature: String,
-    /// Account UUID at the source, if known.
+    /// Account UUID at the source; an empty string means unknown.
     pub uuid: String,
     /// Unix seconds.
     pub fetched_at: u64,
@@ -137,8 +138,9 @@ impl CachedSkin {
         }
     }
 
+    /// True once the entry is at least `cache_minutes` old.
     pub fn is_expired(&self, now_secs: u64, cache_minutes: u64) -> bool {
-        now_secs.saturating_sub(self.fetched_at) >= cache_minutes * 60
+        now_secs.saturating_sub(self.fetched_at) >= cache_minutes.saturating_mul(60)
     }
 }
 
@@ -219,7 +221,8 @@ mod tests {
         p.set_own(skin("b"), 36);
         p.set_own(skin("c"), 36);
         assert_eq!(p.undo(|c| *c == skin("b")), Some(skin("a")));
-        assert!(p.history == vec![Choice::Auto]);
+        assert_eq!(p.choice, skin("a"));
+        assert_eq!(p.history, vec![Choice::Auto]);
     }
 
     #[test]
@@ -268,5 +271,112 @@ mod tests {
         assert_eq!(load::<Players>(Some(&text)).unwrap(), players);
         assert_eq!(load::<Players>(None).unwrap(), Players::default());
         assert!(load::<Players>(Some("{broken")).is_err());
+    }
+
+    #[test]
+    fn undo_skips_entries_equal_to_the_current_choice() {
+        let mut p = PlayerRecord::new("Alice", "u");
+        p.set_own(skin("a"), 36);
+        p.choice = Choice::Auto; // admin clear
+        assert_eq!(p.undo(|_| false), None);
+        assert_eq!(p.choice, Choice::Auto);
+        assert!(p.history.is_empty());
+
+        let mut p = PlayerRecord::new("Alice", "u");
+        p.set_own(skin("b"), 36);
+        p.set_own(skin("c"), 36);
+        p.choice = skin("b"); // admin set
+        assert_eq!(p.undo(|_| false), Some(Choice::Auto));
+        assert_eq!(p.choice, Choice::Auto);
+        assert!(p.history.is_empty());
+    }
+
+    #[test]
+    fn undo_with_everything_blocked_changes_nothing() {
+        let mut p = PlayerRecord::new("Alice", "u");
+        p.set_own(skin("a"), 36);
+        p.set_own(skin("b"), 36);
+        assert_eq!(p.undo(|_| true), None);
+        assert_eq!(p.choice, skin("b"));
+        assert!(p.history.is_empty());
+    }
+
+    #[test]
+    fn zero_cap_keeps_the_history_empty() {
+        let mut p = PlayerRecord::new("Alice", "u");
+        assert!(p.set_own(skin("a"), 0));
+        assert!(p.set_own(skin("b"), 0));
+        assert_eq!(p.choice, skin("b"));
+        assert!(p.history.is_empty());
+    }
+
+    #[test]
+    fn cache_entry_from_the_future_is_not_expired() {
+        let c = CachedSkin {
+            value: "v".into(),
+            signature: "s".into(),
+            uuid: String::new(),
+            fetched_at: 2000,
+        };
+        assert!(!c.is_expired(1000, 15));
+        assert!(!c.is_expired(1000, u64::MAX));
+    }
+
+    #[test]
+    fn cache_keys_ignore_case() {
+        let mut cache = Cache::default();
+        let entry = CachedSkin {
+            value: "v".into(),
+            signature: "s".into(),
+            uuid: "u".into(),
+            fetched_at: 1000,
+        };
+        cache.put(Source::Ely, "NoTcH", entry.clone());
+        assert_eq!(cache.get(Source::Ely, "notch"), Some(&entry));
+        assert_eq!(cache.get(Source::Ely, "NOTCH"), Some(&entry));
+        assert_eq!(cache.get(Source::Mojang, "notch"), None);
+        assert_eq!(cache.skins.keys().collect::<Vec<_>>(), ["ely:notch"]);
+    }
+
+    #[test]
+    fn full_player_record_round_trips() {
+        let mut record = PlayerRecord::new("Alice", "u");
+        record.choice = Choice::skin(Source::Ely, "Notch");
+        record.locked = true;
+        record.history = vec![Choice::Auto, skin("a")];
+        let mut players = Players::default();
+        players.players.insert("alice".into(), record);
+        let text = to_json(&players);
+        assert_eq!(load::<Players>(Some(&text)).unwrap(), players);
+    }
+
+    #[test]
+    fn cache_round_trips() {
+        let mut cache = Cache::default();
+        cache.put(
+            Source::Mojang,
+            "Notch",
+            CachedSkin {
+                value: "v".into(),
+                signature: "s".into(),
+                uuid: "u".into(),
+                fetched_at: 1000,
+            },
+        );
+        let text = to_json(&cache);
+        assert_eq!(load::<Cache>(Some(&text)).unwrap(), cache);
+    }
+
+    #[test]
+    fn missing_locked_and_history_default() {
+        let text = r#"{"players":{"alice":{"name":"Alice","uuid":"u","choice":"auto"}}}"#;
+        let players = load::<Players>(Some(text)).unwrap();
+        assert_eq!(players.players["alice"], PlayerRecord::new("Alice", "u"));
+    }
+
+    #[test]
+    fn invalid_choice_string_is_rejected() {
+        let text = r#"{"players":{"alice":{"name":"Alice","uuid":"u","choice":"nope"}}}"#;
+        assert!(load::<Players>(Some(text)).is_err());
     }
 }
