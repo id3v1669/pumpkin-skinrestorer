@@ -54,6 +54,11 @@ const SKULL_COMMAND: u32 = 2;
 /// Granted to everyone; admin rights are checked by the plugin itself.
 const COMMAND_PERMISSION: &str = "skinrestorer:command";
 
+/// Failed login lookups are logged at most this often.
+const LOOKUP_WARNING_INTERVAL_MS: u64 = 60_000;
+
+const NOT_LOADED: &str = "skinrestorer is not loaded.";
+
 const CONFIG_PATH: &str = "data/config.toml";
 const PLAYERS_PATH: &str = "data/players.json";
 const SKINS_PATH: &str = "data/skins.json";
@@ -88,6 +93,8 @@ enum Purpose {
     /// Queued at login; `dedupe` is its entry in `State::login_lookups`.
     Login {
         dedupe: String,
+        /// Account name being looked up.
+        name: String,
         /// Every player waiting for this lookup, with the skin URL applied at their
         /// login, if any: a player is only told about a skin they are not already
         /// wearing.
@@ -122,6 +129,10 @@ struct State {
     login_lookups: HashMap<String, QueryId>,
     /// `skins.json` needs writing at the end of the tick.
     cache_dirty: bool,
+    /// When a failed login lookup was last logged; see [`LOOKUP_WARNING_INTERVAL_MS`].
+    last_lookup_warning_ms: u64,
+    /// Failed login lookups not logged since then.
+    suppressed_lookup_warnings: u32,
 }
 
 thread_local! {
@@ -310,6 +321,7 @@ fn on_login(player: &Player) {
                     q,
                     Purpose::Login {
                         dedupe,
+                        name: wanted.name.clone(),
                         waiters: vec![(id, applied)],
                     },
                 );
@@ -373,6 +385,22 @@ fn commit_choice(
     s.ops.bump(target_key);
     s.save_players();
     Ok(())
+}
+
+/// Logs a failed login lookup, at most once per [`LOOKUP_WARNING_INTERVAL_MS`]; the
+/// next warning counts the ones left out.
+fn warn_failed_lookup(s: &mut State, name: &str, error: &str, now: u64) {
+    if now.saturating_sub(s.last_lookup_warning_ms) < LOOKUP_WARNING_INTERVAL_MS {
+        s.suppressed_lookup_warnings += 1;
+        return;
+    }
+    let mut message = format!("skin lookup for {name} failed: {error}");
+    let suppressed = std::mem::take(&mut s.suppressed_lookup_warnings);
+    if suppressed > 0 {
+        message.push_str(&format!(" ({suppressed} similar suppressed)"));
+    }
+    s.last_lookup_warning_ms = now;
+    log(Level::Warn, &message);
 }
 
 fn finish(
@@ -472,8 +500,15 @@ fn finish(
                 None => effects.push(Effect::Tell(issuer, format!("No head: {failure}."))),
             }
         }
-        Purpose::Login { dedupe, waiters } => {
+        Purpose::Login {
+            dedupe,
+            name,
+            waiters,
+        } => {
             s.login_lookups.remove(&dedupe);
+            if let Outcome::Failed(e) = &outcome {
+                warn_failed_lookup(s, &name, e, now);
+            }
             if let Some((_, _, skin)) = &found {
                 // Compared by URL: the textures value carries a fresh timestamp.
                 let url = skin_url(&skin.value);
@@ -812,11 +847,18 @@ fn run_skin(
             if record.locked {
                 return Err("Your skin is locked.".into());
             }
+            let history_len = record.history.len();
             let restored = record.undo(|c| match c {
                 Choice::Skin { source, name } => cfg.is_blocked(*source, name),
                 Choice::Auto => false,
             });
             let Some(restored) = restored else {
+                // Entries popped on the way (blocked or equal to the current choice)
+                // stay gone after a restart.
+                if record.history.len() != history_len {
+                    s.ops.bump(&key);
+                    s.save_players();
+                }
                 return Err("Nothing to undo.".into());
             };
             s.ops.bump(&key);
@@ -888,7 +930,12 @@ fn command_text(args: &ConsumedArgs) -> String {
 /// A head to give right away: recipient, account name, skin.
 type Head = (Player, String, SkinData);
 
-async fn handle_skull(sender: &CommandSender, server: &ServerInstance, raw: &str) {
+/// Runs `/skull`; the error is the reply to a failed command.
+async fn handle_skull(
+    sender: &CommandSender,
+    server: &ServerInstance,
+    raw: &str,
+) -> Result<(), String> {
     let now = now_ms();
     let result = with_state(|s| -> Result<(String, Option<Head>), String> {
         let (spec, target) = parse_skull(raw)?;
@@ -924,9 +971,10 @@ async fn handle_skull(sender: &CommandSender, server: &ServerInstance, raw: &str
                 give_skull(&player, &name, &skin).await;
             }
             sender.send_message(text(&reply));
+            Ok(())
         }
-        Some(Err(e)) => sender.send_error(text(&e)),
-        None => sender.send_error(text("skinrestorer is not loaded.")),
+        Some(Err(e)) => Err(e),
+        None => Err(NOT_LOADED.into()),
     }
 }
 
@@ -979,6 +1027,8 @@ fn load_state(online_mode: bool) -> Result<State, String> {
         cooldowns: Cooldowns::default(),
         login_lookups: HashMap::new(),
         cache_dirty: false,
+        last_lookup_warning_ms: 0,
+        suppressed_lookup_warnings: 0,
     })
 }
 
@@ -1055,17 +1105,18 @@ impl Guest for SkinRestorer {
         args: ConsumedArgs,
     ) -> Result<i32, CommandError> {
         let raw = command_text(&args);
+        // An error is the command's result: the host shows its text to the sender.
+        let failed = |e: String| CommandError::CommandFailed(text(&e));
         if command_id == SKULL_COMMAND {
-            handle_skull(&sender, &server, &raw).await;
+            handle_skull(&sender, &server, &raw).await.map_err(failed)?;
             return Ok(1);
         }
         let now = now_ms();
         let result = with_state(|s| run_skin(s, &server, &sender, parse_skin(&raw)?, now));
-        match result {
-            Some(Ok(reply)) => sender.send_message(text(&reply)),
-            Some(Err(e)) => sender.send_error(text(&e)),
-            None => sender.send_error(text("skinrestorer is not loaded.")),
-        }
+        let reply = result
+            .unwrap_or_else(|| Err(NOT_LOADED.into()))
+            .map_err(failed)?;
+        sender.send_message(text(&reply));
         Ok(1)
     }
 

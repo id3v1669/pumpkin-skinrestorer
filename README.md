@@ -46,7 +46,8 @@ after success and 5 s after an error (admins are exempt), and only one of these 
 runs per target player at a time.
 
 `/skin undo` steps back through the player's own earlier choices, skipping blocked ones;
-admin changes are not recorded in that history.
+admin changes don't add to the history; the choice they set is recorded when the player
+next changes their skin.
 
 ## Configuration
 
@@ -65,7 +66,7 @@ Unknown keys are rejected. An invalid file stops the plugin from loading; on
 `/skin reload` it is rejected and the previous config stays. If the file is missing at
 `/skin reload` or `/skin block`/`unblock`, it is recreated with the defaults and the reply
 says so. `/skin block` and `unblock` rewrite only the `blocked` list and keep the comments
-in it.
+in it; they also re-read the rest of the file, like `/skin reload`.
 
 Player choices are kept in `players.json`, fetched skins in `skins.json` (same folder). A
 corrupt state file also stops the plugin from loading, so it is never overwritten.
@@ -113,3 +114,4 @@ Copy the `.wasm` into the server's `plugins/` directory.
 - Lookups, cooldowns and revision counters live in memory; a restart drops running
   lookups.
 - Admin commands only target online players.
+- Failed background lookups are logged as warnings (at most one per minute).
