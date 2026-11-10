@@ -31,11 +31,17 @@ pub struct Wanted {
 pub struct LoginPlan {
     pub apply: Apply,
     pub lookup: Option<Wanted>,
-    /// The stored choice became blocked: reset it to automatic.
+    /// The stored choice became blocked: reset it to automatic; the caller
+    /// must also bump the player's revision (`Ops::bump`).
     pub drop_choice: bool,
 }
 
 /// The login steps from the design, using stored data only.
+///
+/// An explicit choice is refreshed from its own source alone. In automatic
+/// mode the configured source order wins: the first cached, unblocked source
+/// is applied; if that entry is expired every unblocked source is looked up
+/// again, and if it is fresh only the sources ranked above it are.
 pub fn plan_login(
     record: Option<&PlayerRecord>,
     own_name: &str,
@@ -84,26 +90,41 @@ pub fn plan_login(
             drop_choice,
         };
     }
-    let sources: Vec<Source> = cfg
-        .source_order
-        .iter()
-        .copied()
-        .filter(|s| !cfg.is_blocked(*s, own_name))
-        .collect();
-    if !valid_name(own_name) || sources.is_empty() {
+    if !valid_name(own_name) {
         return LoginPlan {
             apply: Apply::Steve,
             lookup: None,
             drop_choice,
         };
     }
-    for &source in &sources {
+    let sources: Vec<Source> = cfg
+        .source_order
+        .iter()
+        .copied()
+        .filter(|s| !cfg.is_blocked(*s, own_name))
+        .collect();
+    if sources.is_empty() {
+        return LoginPlan {
+            apply: Apply::Steve,
+            lookup: None,
+            drop_choice,
+        };
+    }
+    let name = own_name.to_ascii_lowercase();
+    for (i, &source) in sources.iter().enumerate() {
         if let Some(c) = cache.get(source, own_name) {
+            // The source order wins: an expired hit rechecks every source, a
+            // fresh one only the sources ranked above it.
+            let recheck = if c.is_expired(now_secs, cfg.cache_minutes) {
+                sources.clone()
+            } else {
+                sources[..i].to_vec()
+            };
             return LoginPlan {
                 apply: Apply::Skin(c.skin()),
-                lookup: c.is_expired(now_secs, cfg.cache_minutes).then(|| Wanted {
-                    name: own_name.to_ascii_lowercase(),
-                    sources: vec![source],
+                lookup: (!recheck.is_empty()).then_some(Wanted {
+                    name,
+                    sources: recheck,
                 }),
                 drop_choice,
             };
@@ -111,10 +132,7 @@ pub fn plan_login(
     }
     LoginPlan {
         apply: Apply::Steve,
-        lookup: Some(Wanted {
-            name: own_name.to_ascii_lowercase(),
-            sources,
-        }),
+        lookup: Some(Wanted { name, sources }),
         drop_choice,
     }
 }
@@ -218,18 +236,18 @@ mod tests {
     use crate::config::parse;
     use crate::store::CachedSkin;
 
-    fn cached(at: u64) -> CachedSkin {
+    fn cached(value: &str, at: u64) -> CachedSkin {
         CachedSkin {
-            value: "v".into(),
+            value: value.into(),
             signature: "s".into(),
             uuid: "u".into(),
             fetched_at: at,
         }
     }
 
-    fn skin() -> Apply {
+    fn skin(value: &str) -> Apply {
         Apply::Skin(SkinData {
-            value: "v".into(),
+            value: value.into(),
             signature: "s".into(),
         })
     }
@@ -254,18 +272,22 @@ mod tests {
         );
         assert_eq!(p.apply, Apply::Steve);
         assert_eq!(p.lookup, None);
+        let cfg = parse(r#"blocked = ["mojang:notch"]"#).unwrap();
+        let p = plan_login(Some(&r), "Alice", true, &Cache::default(), &cfg, 0);
+        assert_eq!((p.apply, p.lookup), (Apply::Steve, None));
+        assert!(!p.drop_choice);
     }
 
     #[test]
     fn cached_choice_is_applied_and_refreshed_when_expired() {
         let r = record(Choice::skin(Source::Mojang, "notch"));
         let mut cache = Cache::default();
-        cache.put(Source::Mojang, "notch", cached(0));
+        cache.put(Source::Mojang, "notch", cached("v", 0));
         let cfg = Config::default();
         let fresh = plan_login(Some(&r), "Alice", false, &cache, &cfg, 60);
-        assert_eq!((fresh.apply, fresh.lookup), (skin(), None));
+        assert_eq!((fresh.apply, fresh.lookup), (skin("v"), None));
         let stale = plan_login(Some(&r), "Alice", false, &cache, &cfg, 15 * 60);
-        assert_eq!(stale.apply, skin());
+        assert_eq!(stale.apply, skin("v"));
         assert_eq!(
             stale.lookup,
             Some(Wanted {
@@ -301,6 +323,49 @@ mod tests {
     }
 
     #[test]
+    fn blocked_choice_with_own_skin_keeps_it() {
+        let r = record(Choice::skin(Source::Mojang, "notch"));
+        let cfg = parse(r#"blocked = ["mojang:notch"]"#).unwrap();
+        let p = plan_login(Some(&r), "Alice", true, &Cache::default(), &cfg, 0);
+        assert!(p.drop_choice);
+        assert_eq!((p.apply, p.lookup), (Apply::Keep, None));
+    }
+
+    #[test]
+    fn blocked_choice_falls_back_to_the_cached_own_name() {
+        let r = record(Choice::skin(Source::Mojang, "notch"));
+        let cfg = parse(r#"blocked = ["mojang:notch"]"#).unwrap();
+        let mut cache = Cache::default();
+        cache.put(Source::Ely, "alice", cached("own", 0));
+        let p = plan_login(Some(&r), "Alice", false, &cache, &cfg, 60);
+        assert!(p.drop_choice);
+        assert_eq!((p.apply, p.lookup), (skin("own"), None));
+    }
+
+    #[test]
+    fn record_with_automatic_choice_is_planned_like_no_record() {
+        let r = record(Choice::Auto);
+        let cfg = Config::default();
+        let kept = plan_login(Some(&r), "Alice", true, &Cache::default(), &cfg, 0);
+        assert_eq!((kept.apply, kept.lookup), (Apply::Keep, None));
+        assert!(!kept.drop_choice);
+        let p = plan_login(Some(&r), "Alice", false, &Cache::default(), &cfg, 0);
+        assert_eq!(
+            p,
+            plan_login(None, "Alice", false, &Cache::default(), &cfg, 0)
+        );
+        assert_eq!(p.apply, Apply::Steve);
+        assert_eq!(
+            p.lookup,
+            Some(Wanted {
+                name: "alice".into(),
+                sources: vec![Source::Ely, Source::Mojang]
+            })
+        );
+        assert!(!p.drop_choice);
+    }
+
+    #[test]
     fn own_profile_skin_is_kept_in_auto() {
         let p = plan_login(
             None,
@@ -315,11 +380,58 @@ mod tests {
     }
 
     #[test]
-    fn auto_uses_the_first_cached_source() {
+    fn auto_prefers_the_first_source_when_both_are_cached() {
         let mut cache = Cache::default();
-        cache.put(Source::Mojang, "alice", cached(0));
+        cache.put(Source::Ely, "alice", cached("ely", 0));
+        cache.put(Source::Mojang, "alice", cached("mojang", 0));
         let p = plan_login(None, "Alice", false, &cache, &Config::default(), 60);
-        assert_eq!((p.apply, p.lookup), (skin(), None));
+        assert_eq!((p.apply, p.lookup), (skin("ely"), None));
+    }
+
+    #[test]
+    fn auto_with_a_lower_priority_hit_looks_up_the_sources_before_it() {
+        let mut cache = Cache::default();
+        cache.put(Source::Mojang, "alice", cached("mojang", 0));
+        let p = plan_login(None, "Alice", false, &cache, &Config::default(), 60);
+        assert_eq!(p.apply, skin("mojang"));
+        assert_eq!(
+            p.lookup,
+            Some(Wanted {
+                name: "alice".into(),
+                sources: vec![Source::Ely]
+            })
+        );
+    }
+
+    #[test]
+    fn auto_with_an_expired_hit_looks_up_all_sources() {
+        let mut cache = Cache::default();
+        cache.put(Source::Ely, "alice", cached("ely", 0));
+        let p = plan_login(None, "Alice", false, &cache, &Config::default(), 15 * 60);
+        assert_eq!(p.apply, skin("ely"));
+        assert_eq!(
+            p.lookup,
+            Some(Wanted {
+                name: "alice".into(),
+                sources: vec![Source::Ely, Source::Mojang]
+            })
+        );
+    }
+
+    #[test]
+    fn auto_ignores_a_cached_skin_from_a_blocked_source() {
+        let cfg = parse(r#"blocked = ["ely:alice"]"#).unwrap();
+        let mut cache = Cache::default();
+        cache.put(Source::Ely, "alice", cached("ely", 0));
+        let p = plan_login(None, "Alice", false, &cache, &cfg, 60);
+        assert_eq!(p.apply, Apply::Steve);
+        assert_eq!(
+            p.lookup,
+            Some(Wanted {
+                name: "alice".into(),
+                sources: vec![Source::Mojang]
+            })
+        );
     }
 
     #[test]
@@ -367,6 +479,12 @@ mod tests {
         assert_eq!(c.check("a", 30_000), Ok(()));
         c.start("a", false, 0);
         assert_eq!(c.check("a", 4_001), Err(1));
+        c.start("a", true, 0);
+        assert_eq!(c.check("a", 29_999), Err(1));
+        c.start("b", false, 0);
+        assert_eq!(c.check("b", 0), Err(5));
+        assert_eq!(c.check("b", 4_999), Err(1));
+        assert_eq!(c.check("b", 5_000), Ok(()));
     }
 
     #[test]
@@ -383,6 +501,7 @@ mod tests {
     #[test]
     fn stale_results_are_refused() {
         assert_eq!(may_commit(1, 1, false, false, None), Ok(()));
+        assert_eq!(may_commit(1, 1, false, false, Some(true)), Ok(()));
         assert_eq!(
             may_commit(1, 2, false, false, None),
             Err(Superseded::Changed)
