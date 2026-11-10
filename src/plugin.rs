@@ -930,12 +930,7 @@ fn command_text(args: &ConsumedArgs) -> String {
 /// A head to give right away: recipient, account name, skin.
 type Head = (Player, String, SkinData);
 
-/// Runs `/skull`; the error is the reply to a failed command.
-async fn handle_skull(
-    sender: &CommandSender,
-    server: &ServerInstance,
-    raw: &str,
-) -> Result<(), String> {
+async fn handle_skull(sender: &CommandSender, server: &ServerInstance, raw: &str) {
     let now = now_ms();
     let result = with_state(|s| -> Result<(String, Option<Head>), String> {
         let (spec, target) = parse_skull(raw)?;
@@ -971,10 +966,9 @@ async fn handle_skull(
                 give_skull(&player, &name, &skin).await;
             }
             sender.send_message(text(&reply));
-            Ok(())
         }
-        Some(Err(e)) => Err(e),
-        None => Err(NOT_LOADED.into()),
+        Some(Err(e)) => sender.send_error(text(&e)),
+        None => sender.send_error(text(NOT_LOADED)),
     }
 }
 
@@ -1105,18 +1099,17 @@ impl Guest for SkinRestorer {
         args: ConsumedArgs,
     ) -> Result<i32, CommandError> {
         let raw = command_text(&args);
-        // An error is the command's result: the host shows its text to the sender.
-        let failed = |e: String| CommandError::CommandFailed(text(&e));
         if command_id == SKULL_COMMAND {
-            handle_skull(&sender, &server, &raw).await.map_err(failed)?;
+            handle_skull(&sender, &server, &raw).await;
             return Ok(1);
         }
         let now = now_ms();
         let result = with_state(|s| run_skin(s, &server, &sender, parse_skin(&raw)?, now));
-        let reply = result
-            .unwrap_or_else(|| Err(NOT_LOADED.into()))
-            .map_err(failed)?;
-        sender.send_message(text(&reply));
+        match result {
+            Some(Ok(reply)) => sender.send_message(text(&reply)),
+            Some(Err(e)) => sender.send_error(text(&e)),
+            None => sender.send_error(text(NOT_LOADED)),
+        }
         Ok(1)
     }
 
