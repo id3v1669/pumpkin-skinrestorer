@@ -3,6 +3,7 @@
 
 pub mod config;
 pub mod lookup;
+pub mod resolve;
 pub mod skin;
 pub mod source;
 pub mod store;
