@@ -160,5 +160,14 @@ mod tests {
         let mut out = Vec::new();
         write_var_int(&mut out, 300);
         assert_eq!(out, vec![0xac, 0x02]);
+        for (value, bytes) in [
+            (127, vec![0x7f]),
+            (128, vec![0x80, 0x01]),
+            (16384, vec![0x80, 0x80, 0x01]),
+        ] {
+            let mut out = Vec::new();
+            write_var_int(&mut out, value);
+            assert_eq!(out, bytes);
+        }
     }
 }

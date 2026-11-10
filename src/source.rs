@@ -66,6 +66,7 @@ pub struct HttpResponse {
 
 /// Bulk name-to-UUID lookup for up to [`Source::batch_limit`] names.
 pub fn uuid_batch_request(source: Source, names: &[String]) -> HttpRequest {
+    debug_assert!(names.len() <= source.batch_limit());
     let body = serde_json::to_vec(names).expect("a list of strings always serialises");
     let (host, path) = match source {
         Source::Ely => ("authserver.ely.by", "/api/profiles/minecraft"),
@@ -106,13 +107,27 @@ struct IdName {
     name: String,
 }
 
+/// A UUID as 32 hex digits, or hyphenated 8-4-4-4-12. Keeps ids safe inside URL paths.
+fn valid_uuid(id: &str) -> bool {
+    let bytes = id.as_bytes();
+    match bytes.len() {
+        32 => bytes.iter().all(u8::is_ascii_hexdigit),
+        36 => bytes.iter().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => *b == b'-',
+            _ => b.is_ascii_hexdigit(),
+        }),
+        _ => false,
+    }
+}
+
 /// Parses a bulk lookup answer into `(lowercase name, uuid)` pairs. Names that were not
-/// found are simply absent.
+/// found are simply absent; entries with a malformed id or name are dropped.
 pub fn parse_uuid_batch(body: &[u8]) -> Result<Vec<(String, String)>, String> {
     let found: Vec<IdName> =
         serde_json::from_slice(body).map_err(|e| format!("bad name lookup answer: {e}"))?;
     Ok(found
         .into_iter()
+        .filter(|p| valid_uuid(&p.id) && valid_name(&p.name))
         .map(|p| (p.name.to_ascii_lowercase(), p.id))
         .collect())
 }
@@ -138,7 +153,9 @@ struct Property {
 }
 
 /// Parses a profile answer (both sources use the Mojang profile shape). `Ok(None)` when
-/// the account has no signed custom skin a vanilla client would show.
+/// the account has no signed custom skin a vanilla client would show. The caller handles
+/// 204/404 answers (empty body) before calling this: an empty or non-JSON body is an
+/// error here.
 pub fn parse_skin(body: &[u8]) -> Result<Option<SkinData>, String> {
     let profile: Profile =
         serde_json::from_slice(body).map_err(|e| format!("bad profile answer: {e}"))?;
@@ -192,6 +209,7 @@ mod tests {
     fn names_are_validated() {
         assert!(valid_name("Notch"));
         assert!(valid_name("a_b_9"));
+        assert!(valid_name("sixteen_chars___"));
         assert!(!valid_name(""));
         assert!(!valid_name("seventeen_chars__"));
         assert!(!valid_name("../etc"));
@@ -204,11 +222,11 @@ mod tests {
         let req = uuid_batch_request(Source::Mojang, &names);
         assert_eq!(req.method, Method::Post);
         assert_eq!(req.host, "api.minecraftservices.com");
+        assert_eq!(req.path, "/minecraft/profile/lookup/bulk/byname");
         assert_eq!(req.body.as_deref(), Some(&br#"["Notch","jeb_"]"#[..]));
-        assert_eq!(
-            uuid_batch_request(Source::Ely, &names).host,
-            "authserver.ely.by"
-        );
+        let ely = uuid_batch_request(Source::Ely, &names);
+        assert_eq!(ely.host, "authserver.ely.by");
+        assert_eq!(ely.path, "/api/profiles/minecraft");
     }
 
     #[test]
@@ -219,6 +237,7 @@ mod tests {
             ("skinsystem.ely.by", "/textures/signed/Notch")
         );
         let moj = skin_request(Source::Mojang, "Notch", "069a79f4");
+        assert_eq!(moj.host, "sessionserver.mojang.com");
         assert_eq!(
             moj.path,
             "/session/minecraft/profile/069a79f4?unsigned=false"
@@ -227,12 +246,31 @@ mod tests {
 
     #[test]
     fn uuid_batch_lowercases_names() {
-        let body = br#"[{"id":"069a79f4","name":"Notch"}]"#;
+        let body = br#"[{"id":"069a79f444e94726a5befca90e38aaf5","name":"Notch"}]"#;
         assert_eq!(
             parse_uuid_batch(body).unwrap(),
-            vec![("notch".into(), "069a79f4".into())]
+            vec![("notch".into(), "069a79f444e94726a5befca90e38aaf5".into())]
         );
         assert!(parse_uuid_batch(b"oops").is_err());
+    }
+
+    #[test]
+    fn uuid_batch_drops_bad_ids_and_names() {
+        let body = br#"[
+            {"id":"../x?y","name":"evil"},
+            {"id":"069a79f444e94726a5befca90e38aaf5","name":"Notch"},
+            {"id":"853c80ef-3c37-49fd-aa49-938b674adae6","name":"jeb_"},
+            {"id":"61699b2ed3274a019f1e0ea8c3f06bc6","name":"../etc"},
+            {"id":"069a79f444e94726a5befca90e38aaf","name":"short"},
+            {"id":"853c80ef3c37-49fd-aa49-938b674adae6-","name":"shifted"}
+        ]"#;
+        assert_eq!(
+            parse_uuid_batch(body).unwrap(),
+            vec![
+                ("notch".into(), "069a79f444e94726a5befca90e38aaf5".into()),
+                ("jeb_".into(), "853c80ef-3c37-49fd-aa49-938b674adae6".into()),
+            ]
+        );
     }
 
     #[test]
@@ -250,5 +288,26 @@ mod tests {
         let ely = textures("http://ely.by/storage/skins/x.png");
         assert_eq!(parse_skin(&profile(&ely, Some("sig"))).unwrap(), None);
         assert_eq!(parse_skin(br#"{"id":"a","name":"b"}"#).unwrap(), None);
+        assert_eq!(parse_skin(&profile(&v, Some(""))).unwrap(), None);
+        assert_eq!(
+            parse_skin(&profile("not base64!", Some("sig"))).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn textures_need_not_be_the_first_property() {
+        let v = textures("http://textures.minecraft.net/texture/abc");
+        let body = format!(
+            r#"{{"id":"abc","name":"Notch","properties":[{{"name":"other","value":"x"}},{{"name":"textures","value":"{v}","signature":"sig"}}]}}"#
+        );
+        let skin = parse_skin(body.as_bytes()).unwrap().unwrap();
+        assert_eq!(skin.value, v);
+    }
+
+    #[test]
+    fn empty_or_non_json_profile_body_is_an_error() {
+        assert!(parse_skin(b"").is_err());
+        assert!(parse_skin(b"oops").is_err());
     }
 }
