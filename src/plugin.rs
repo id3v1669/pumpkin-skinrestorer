@@ -47,7 +47,9 @@ use crate::resolve::{
 };
 use crate::skin::{profile_component, skin_url, steve};
 use crate::source::{SkinData, Source};
-use crate::store::{self, Cache, CachedSkin, Choice, PlayerRecord, Players, player_key, to_json};
+use crate::store::{
+    self, Cache, CacheSeq, CachedSkin, Choice, PlayerRecord, Players, player_key, to_json,
+};
 
 const LOGIN_HANDLER: u32 = 1;
 const TICK_TASK: u32 = 1;
@@ -131,6 +133,8 @@ struct State {
     online_mode: bool,
     players: Players,
     cache: Cache,
+    /// Which answer last wrote each cache entry; see [`CacheSeq`].
+    cache_seq: CacheSeq,
     engine: Engine,
     http: HashMap<ReqId, http::Request>,
     /// Running lookups: the name looked up and what it is for.
@@ -434,12 +438,16 @@ fn finish(
 ) -> Vec<Effect> {
     // A source that no longer has a skin for the name must not keep winning from the
     // cache. The answer may be old by now (the lookup went on to other sources): an
-    // entry fetched after it stays.
-    for &(source, answered_at_ms) in outcome.not_found_in() {
-        if s.cache
-            .remove_if_not_newer(source, lookup_name, answered_at_ms / 1000)
+    // entry written from a later answer stays. Removals come before this outcome's own
+    // write.
+    for &(source, not_found_seq) in outcome.not_found_in() {
+        if s.cache_seq
+            .should_remove(source, lookup_name, not_found_seq)
         {
-            s.cache_dirty = true;
+            s.cache_seq.forget(source, lookup_name);
+            if s.cache.remove(source, lookup_name) {
+                s.cache_dirty = true;
+            }
         }
     }
     let found = match &outcome {
@@ -448,8 +456,10 @@ fn finish(
             name,
             uuid,
             skin,
+            answered_seq,
             ..
         } => {
+            s.cache_seq.record_write(*source, name, *answered_seq);
             s.cache.put(
                 *source,
                 name,
@@ -1084,6 +1094,7 @@ fn load_state(online_mode: bool) -> Result<State, String> {
         online_mode,
         players,
         cache,
+        cache_seq: CacheSeq::default(),
         engine: Engine::new(),
         http: HashMap::new(),
         purposes: HashMap::new(),

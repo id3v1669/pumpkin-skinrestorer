@@ -1,6 +1,6 @@
 //! Stored state: player records (`players.json`) and the skin cache (`skins.json`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -163,25 +163,34 @@ impl Cache {
     pub fn remove(&mut self, source: Source, name: &str) -> bool {
         self.skins.remove(&skin_key(source, name)).is_some()
     }
+}
 
-    /// Drops an entry that a "not found" answered at `answered_at_secs` (Unix seconds)
-    /// disproves: one fetched no later than that answer. An entry fetched after it is
-    /// newer knowledge and stays. True if an entry was dropped.
-    ///
-    /// `fetched_at` has whole-second resolution, so a fetch and an answer in the same
-    /// second cannot be ordered; the entry is treated as older and dropped. The cost of
-    /// guessing wrong that way is one more lookup, the other way a skin the source no
-    /// longer has keeps being applied until it expires.
-    pub fn remove_if_not_newer(
-        &mut self,
-        source: Source,
-        name: &str,
-        answered_at_secs: u64,
-    ) -> bool {
-        match self.get(source, name) {
-            Some(c) if c.fetched_at <= answered_at_secs => self.remove(source, name),
-            _ => false,
-        }
+/// For each cache entry, the lookup engine's sequence number of the answer that last
+/// wrote it. Kept in memory only: an entry loaded from disk has no number and counts as
+/// 0, older than every answer of this run.
+#[derive(Debug, Default)]
+pub struct CacheSeq {
+    /// Keyed like [`Cache::skins`].
+    written: HashMap<String, u64>,
+}
+
+impl CacheSeq {
+    /// Notes that the entry was written from the answer numbered `seq`.
+    pub fn record_write(&mut self, source: Source, name: &str, seq: u64) {
+        self.written.insert(skin_key(source, name), seq);
+    }
+
+    /// Forgets a removed entry.
+    pub fn forget(&mut self, source: Source, name: &str) {
+        self.written.remove(&skin_key(source, name));
+    }
+
+    /// True if a "not found" numbered `not_found_seq` disproves the entry: the entry
+    /// was written from an earlier answer. One written from a later answer is newer
+    /// knowledge and stays.
+    pub fn should_remove(&self, source: Source, name: &str, not_found_seq: u64) -> bool {
+        let entry_seq = self.written.get(&skin_key(source, name)).copied();
+        entry_seq.unwrap_or(0) < not_found_seq
     }
 }
 
@@ -422,39 +431,40 @@ mod tests {
         assert!(!cache.remove(Source::Ely, "alice"));
     }
 
-    fn fetched(at: u64) -> CachedSkin {
-        CachedSkin {
-            value: "v".into(),
-            signature: "s".into(),
-            uuid: "u".into(),
-            fetched_at: at,
-        }
+    #[test]
+    fn entry_written_after_the_not_found_is_kept() {
+        let mut seqs = CacheSeq::default();
+        seqs.record_write(Source::Ely, "Alice", 7);
+        assert!(!seqs.should_remove(Source::Ely, "alice", 5));
+        // The same answer cannot disprove itself either.
+        assert!(!seqs.should_remove(Source::Ely, "alice", 7));
     }
 
     #[test]
-    fn not_found_removes_an_entry_fetched_before_the_answer() {
-        let mut cache = Cache::default();
-        cache.put(Source::Ely, "alice", fetched(999));
-        cache.put(Source::Mojang, "alice", fetched(999));
-        assert!(cache.remove_if_not_newer(Source::Ely, "ALICE", 1000));
-        assert_eq!(cache.get(Source::Ely, "alice"), None);
-        assert_eq!(cache.get(Source::Mojang, "alice"), Some(&fetched(999)));
-        assert!(!cache.remove_if_not_newer(Source::Ely, "alice", 1000));
+    fn entry_written_before_the_not_found_is_removed() {
+        let mut seqs = CacheSeq::default();
+        seqs.record_write(Source::Ely, "alice", 5);
+        seqs.record_write(Source::Mojang, "alice", 9);
+        assert!(seqs.should_remove(Source::Ely, "ALICE", 7));
+        assert!(!seqs.should_remove(Source::Mojang, "alice", 7));
+        // A rewrite moves the entry behind the not-found again.
+        seqs.record_write(Source::Ely, "alice", 8);
+        assert!(!seqs.should_remove(Source::Ely, "alice", 7));
     }
 
     #[test]
-    fn not_found_keeps_an_entry_fetched_after_the_answer() {
-        let mut cache = Cache::default();
-        cache.put(Source::Ely, "alice", fetched(1001));
-        assert!(!cache.remove_if_not_newer(Source::Ely, "alice", 1000));
-        assert_eq!(cache.get(Source::Ely, "alice"), Some(&fetched(1001)));
+    fn entry_loaded_from_disk_is_removed_by_any_not_found() {
+        let seqs = CacheSeq::default();
+        assert!(seqs.should_remove(Source::Ely, "alice", 1));
+        assert!(seqs.should_remove(Source::Ely, "alice", u64::MAX));
     }
 
     #[test]
-    fn not_found_removes_an_entry_fetched_in_the_same_second() {
-        let mut cache = Cache::default();
-        cache.put(Source::Ely, "alice", fetched(1000));
-        assert!(cache.remove_if_not_newer(Source::Ely, "alice", 1000));
-        assert_eq!(cache.get(Source::Ely, "alice"), None);
+    fn forgotten_entry_counts_as_loaded_from_disk() {
+        let mut seqs = CacheSeq::default();
+        seqs.record_write(Source::Ely, "alice", 7);
+        assert!(!seqs.should_remove(Source::Ely, "alice", 5));
+        seqs.forget(Source::Ely, "Alice");
+        assert!(seqs.should_remove(Source::Ely, "alice", 5));
     }
 }

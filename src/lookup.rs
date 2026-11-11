@@ -21,9 +21,10 @@ pub const MAX_QUEUED: usize = 256;
 /// Pause after HTTP 429 without a `Retry-After` header.
 pub const DEFAULT_BACKOFF_SECS: u64 = 60;
 
-/// A source's authoritative "not found" and when it answered: the `now` (ms) passed to
-/// [`Engine::on_response`] with that answer. A query can finish much later, after
-/// waiting on other sources, so the finish time says nothing about this answer's age.
+/// A source's authoritative "not found" and its place in the engine's order of answers
+/// (the engine counts every answer it processes). A query can finish much later, after waiting on other
+/// sources, and clock times cannot order two answers closer than their resolution; the
+/// sequence number can.
 pub type NotFoundAt = (Source, u64);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,8 +36,10 @@ pub enum Outcome {
         uuid: String,
         skin: SkinData,
         /// Sources tried before `source` that have no usable skin for the name, each
-        /// with the time (ms) it answered.
+        /// with the sequence number of its answer.
         not_found_in: Vec<NotFoundAt>,
+        /// Sequence number of the answer that delivered `skin`.
+        answered_seq: u64,
     },
     /// Every source answered that it has no usable skin.
     NotFound { not_found_in: Vec<NotFoundAt> },
@@ -100,6 +103,11 @@ pub struct Engine {
     requests: HashMap<ReqId, Req>,
     backoff_until: HashMap<Source, u64>,
     finished: Vec<(QueryId, Outcome)>,
+    /// Number of source answers processed so far: every response handled in
+    /// [`Engine::on_response`] and every key failed inside [`Engine::poll_requests`].
+    /// An answer is stamped with the count including itself, so stamps start at 1 and
+    /// a later answer always has a greater one.
+    answer_seq: u64,
 }
 
 impl Engine {
@@ -110,6 +118,11 @@ impl Engine {
     fn id(&mut self) -> u64 {
         self.next_id += 1;
         self.next_id
+    }
+
+    fn next_answer_seq(&mut self) -> u64 {
+        self.answer_seq += 1;
+        self.answer_seq
     }
 
     /// Distinct lookups currently queued or running.
@@ -206,10 +219,12 @@ impl Engine {
         }
     }
 
+    /// Ends the lookup for `key` with the answer numbered `seq`.
     fn finish_key(
         &mut self,
         key: &Key,
         result: Result<Option<(String, SkinData)>, String>,
+        seq: u64,
         now: u64,
     ) {
         let Some(state) = self.keys.remove(key) else {
@@ -231,12 +246,13 @@ impl Engine {
                             uuid: uuid.clone(),
                             skin: skin.clone(),
                             not_found_in,
+                            answered_seq: seq,
                         },
                     ));
                 }
                 Ok(None) => {
                     if let Some(q) = self.queries.get_mut(&id) {
-                        q.not_found_in.push((key.0, now));
+                        q.not_found_in.push((key.0, seq));
                     }
                     self.advance(id, now);
                 }
@@ -264,7 +280,8 @@ impl Engine {
             if self.paused(source, now) {
                 let (_, keys) = self.pending.remove(&source).expect("due batch exists");
                 for key in keys {
-                    self.finish_key(&key, Err("rate limited".into()), now);
+                    let seq = self.next_answer_seq();
+                    self.finish_key(&key, Err("rate limited".into()), seq, now);
                 }
                 continue;
             }
@@ -304,7 +321,8 @@ impl Engine {
                 break;
             }
             if self.paused(key.0, now) {
-                self.finish_key(&key, Err("rate limited".into()), now);
+                let seq = self.next_answer_seq();
+                self.finish_key(&key, Err("rate limited".into()), seq, now);
                 continue;
             }
             if let Some(state) = self.keys.get_mut(&key) {
@@ -330,6 +348,8 @@ impl Engine {
         let Some(req) = self.requests.remove(&req) else {
             return;
         };
+        // One response is one answer: the keys it settles share its number.
+        let seq = self.next_answer_seq();
         match req {
             Req::Batch { source, keys } => {
                 let found = match result {
@@ -345,7 +365,7 @@ impl Engine {
                 match found {
                     Err(e) => {
                         for key in keys {
-                            self.finish_key(&key, Err(e.clone()), now);
+                            self.finish_key(&key, Err(e.clone()), seq, now);
                         }
                     }
                     Ok(found) => {
@@ -357,7 +377,7 @@ impl Engine {
                                         state.stage = Stage::WantSkin { uuid: uuid.clone() };
                                     }
                                 }
-                                None => self.finish_key(&key, Ok(None), now),
+                                None => self.finish_key(&key, Ok(None), seq, now),
                             }
                         }
                     }
@@ -380,7 +400,7 @@ impl Engine {
                     }
                     Ok(r) => Err(format!("HTTP {}", r.status)),
                 };
-                self.finish_key(&key, outcome, now);
+                self.finish_key(&key, outcome, seq, now);
             }
         }
     }
@@ -408,7 +428,7 @@ mod tests {
         })
     }
 
-    /// Not found in each source, answered at the paired time.
+    /// Not found in each source, answered at the paired sequence number.
     fn not_found(sources: &[(Source, u64)]) -> Outcome {
         Outcome::NotFound {
             not_found_in: sources.to_vec(),
@@ -518,7 +538,7 @@ mod tests {
         e.submit("Notch", &[Source::Mojang], 0).unwrap();
         let reqs = e.poll_requests(1000);
         e.on_response(reqs[0].0, status(204, None), 1000);
-        assert_eq!(e.take_finished()[0].1, not_found(&[(Source::Mojang, 1000)]));
+        assert_eq!(e.take_finished()[0].1, not_found(&[(Source::Mojang, 1)]));
         assert_eq!(e.queued(), 0);
     }
 
@@ -583,7 +603,7 @@ mod tests {
             ok(r#"{"id":"069a79f444e94726a5befca90e38aaf5","name":"Notch","properties":[]}"#),
             1000,
         );
-        assert_eq!(e.take_finished()[0].1, not_found(&[(Source::Mojang, 1000)]));
+        assert_eq!(e.take_finished()[0].1, not_found(&[(Source::Mojang, 2)]));
         assert_eq!(e.queued(), 0);
     }
 
@@ -718,7 +738,7 @@ mod tests {
             busy[0].1,
             Outcome::Failed {
                 error: "busy".into(),
-                not_found_in: vec![(Source::Mojang, 0)],
+                not_found_in: vec![(Source::Mojang, 1)],
             }
         );
         assert_eq!(e.queued(), MAX_QUEUED - BATCH_SIZE);
@@ -830,10 +850,7 @@ mod tests {
         assert_eq!(batch.len(), 1);
         e.on_response(batch[0].0, ok(&ids(&["b"])), 1000);
         // "c" has no other source, "a" moves to Mojang, "b" gets its skin request.
-        assert_eq!(
-            e.take_finished(),
-            vec![(c, not_found(&[(Source::Ely, 1000)]))]
-        );
+        assert_eq!(e.take_finished(), vec![(c, not_found(&[(Source::Ely, 1)]))]);
         let reqs = e.poll_requests(2000);
         assert_eq!(reqs.len(), 2);
         let mojang = reqs
@@ -935,8 +952,8 @@ mod tests {
                 ..
             } => assert_eq!(
                 (*source, not_found_in),
-                // Stamped with the time Ely answered, not the time the query finished.
-                (Source::Mojang, &vec![(Source::Ely, 1000)])
+                // Stamped with Ely's place in the order of answers.
+                (Source::Mojang, &vec![(Source::Ely, 1)])
             ),
             other => panic!("unexpected {other:?}"),
         }
@@ -992,7 +1009,7 @@ mod tests {
         answer_found(&mut e, 2000, "alice");
         match &e.take_finished()[0].1 {
             Outcome::Found { not_found_in, .. } => {
-                assert_eq!(not_found_in, &vec![(Source::Ely, 1000)])
+                assert_eq!(not_found_in, &vec![(Source::Ely, 2)])
             }
             other => panic!("unexpected {other:?}"),
         }
@@ -1009,7 +1026,7 @@ mod tests {
         e.on_response(reqs[0].0, status(404, None), 2000);
         assert_eq!(
             e.take_finished()[0].1,
-            not_found(&[(Source::Ely, 1000), (Source::Mojang, 2000)])
+            not_found(&[(Source::Ely, 1), (Source::Mojang, 2)])
         );
 
         e.submit("Alice", &[Source::Ely, Source::Mojang], 3000)
@@ -1022,8 +1039,133 @@ mod tests {
             e.take_finished()[0].1,
             Outcome::Failed {
                 error: "mojang: timed out".into(),
-                not_found_in: vec![(Source::Ely, 4000)],
+                not_found_in: vec![(Source::Ely, 3)],
             }
         );
+    }
+
+    /// The sequence number of a `Found` outcome's skin answer.
+    fn answered_seq(outcome: &Outcome) -> u64 {
+        match outcome {
+            Outcome::Found { answered_seq, .. } => *answered_seq,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn answer_stamps_strictly_increase() {
+        // Every step happens at the same `now`: the order comes from the counter.
+        let mut e = Engine::new();
+        let mut stamps = Vec::new();
+        for name in ["a", "b", "c"] {
+            e.submit(name, &[Source::Mojang], 0).unwrap();
+            let reqs = e.poll_requests(BATCH_WINDOW_MS);
+            e.on_response(reqs[0].0, status(204, None), BATCH_WINDOW_MS);
+            stamps.push(e.take_finished()[0].1.not_found_in()[0].1);
+        }
+        e.submit("d", &[Source::Mojang], 0).unwrap();
+        answer_found(&mut e, BATCH_WINDOW_MS, "d");
+        stamps.push(answered_seq(&e.take_finished()[0].1));
+        // A key failed inside `poll_requests` is an answer too.
+        let reqs = {
+            e.submit("e", &[Source::Mojang], 0).unwrap();
+            e.poll_requests(BATCH_WINDOW_MS)
+        };
+        e.on_response(reqs[0].0, status(429, Some(30)), BATCH_WINDOW_MS);
+        e.take_finished();
+        e.submit("f", &[Source::Ely], 0).unwrap();
+        let reqs = e.poll_requests(BATCH_WINDOW_MS);
+        e.on_response(reqs[0].0, status(204, None), BATCH_WINDOW_MS);
+        stamps.push(e.take_finished()[0].1.not_found_in()[0].1);
+        assert!(stamps[0] > 0, "{stamps:?}");
+        assert!(stamps.windows(2).all(|w| w[0] < w[1]), "{stamps:?}");
+    }
+
+    #[test]
+    fn a_key_failed_while_polling_takes_a_place_in_the_order() {
+        let mut e = Engine::new();
+        // Pause Mojang, with a second key still waiting for its batch.
+        e.submit("a", &[Source::Mojang], 0).unwrap();
+        let reqs = e.poll_requests(BATCH_WINDOW_MS);
+        e.submit("b", &[Source::Mojang], BATCH_WINDOW_MS).unwrap();
+        e.on_response(reqs[0].0, status(429, Some(30)), BATCH_WINDOW_MS);
+        e.take_finished();
+        e.submit("c", &[Source::Ely], 0).unwrap();
+        let reqs = e.poll_requests(BATCH_WINDOW_MS);
+        e.on_response(reqs[0].0, status(204, None), BATCH_WINDOW_MS);
+        let before = e.take_finished()[0].1.not_found_in()[0].1;
+        // "b" fails inside `poll_requests`: no response, but an answer.
+        assert!(e.poll_requests(2 * BATCH_WINDOW_MS).is_empty());
+        assert_eq!(e.take_finished()[0].1, failed("mojang: rate limited"));
+        e.submit("d", &[Source::Ely], 2 * BATCH_WINDOW_MS).unwrap();
+        let reqs = e.poll_requests(3 * BATCH_WINDOW_MS);
+        e.on_response(reqs[0].0, status(204, None), 3 * BATCH_WINDOW_MS);
+        let after = e.take_finished()[0].1.not_found_in()[0].1;
+        assert_eq!(after, before + 2);
+    }
+
+    #[test]
+    fn not_found_is_ordered_before_the_later_hit() {
+        let mut e = Engine::new();
+        let now = BATCH_WINDOW_MS;
+        e.submit("Alice", &[Source::Ely, Source::Mojang], 0)
+            .unwrap();
+        let reqs = e.poll_requests(now);
+        e.on_response(reqs[0].0, status(204, None), now);
+        answer_found(&mut e, 2 * now, "alice");
+        let outcome = e.take_finished().remove(0).1;
+        let ely_not_found = outcome.not_found_in()[0];
+        assert_eq!(ely_not_found.0, Source::Ely);
+        assert!(ely_not_found.1 < answered_seq(&outcome), "{outcome:?}");
+    }
+
+    /// The review scenario: an Ely "not found" whose lookup is still waiting for Mojang
+    /// must be ordered before a later successful Ely answer for the same name, even
+    /// when every step happens at the same `now`.
+    #[test]
+    fn hit_after_a_pending_not_found_is_ordered_after_it() {
+        let now = BATCH_WINDOW_MS;
+        let mut e = Engine::new();
+        // A: Ely has nothing, the lookup goes on to Mojang and waits there.
+        let a = e
+            .submit("Alice", &[Source::Ely, Source::Mojang], now)
+            .unwrap();
+        let reqs = e.poll_requests(2 * now);
+        assert_eq!(reqs[0].1.host, "authserver.ely.by");
+        e.on_response(reqs[0].0, status(204, None), now);
+        assert!(e.take_finished().is_empty());
+        // B: the same Ely name, submitted afterwards, is batched and answered with a
+        // skin while A is still waiting.
+        let b = e.submit("Alice", &[Source::Ely], now).unwrap();
+        let reqs = e.poll_requests(2 * now);
+        let ely = reqs
+            .iter()
+            .find(|(_, r)| r.host == "authserver.ely.by")
+            .expect("name lookup at Ely.by");
+        let mojang = reqs
+            .iter()
+            .find(|(_, r)| r.host == "api.minecraftservices.com")
+            .expect("name lookup at Mojang");
+        e.on_response(ely.0, ok(&ids(&["alice"])), now);
+        let skin = e.poll_requests(now);
+        assert_eq!(skin.len(), 1);
+        e.on_response(skin[0].0, ok(&profile_body()), now);
+        let done = e.take_finished();
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].0, b);
+        let b_seq = answered_seq(&done[0].1);
+        // A finishes last, carrying the old Ely "not found".
+        e.on_response(mojang.0, status(204, None), now);
+        let done = e.take_finished();
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].0, a);
+        let a_not_found = done[0].1.not_found_in();
+        assert_eq!(a_not_found[0].0, Source::Ely);
+        assert!(
+            a_not_found[0].1 < b_seq,
+            "Ely not-found stamp {} must precede the later hit {b_seq}",
+            a_not_found[0].1
+        );
+        assert!(b_seq < a_not_found[1].1);
     }
 }
