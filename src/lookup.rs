@@ -21,6 +21,11 @@ pub const MAX_QUEUED: usize = 256;
 /// Pause after HTTP 429 without a `Retry-After` header.
 pub const DEFAULT_BACKOFF_SECS: u64 = 60;
 
+/// A source's authoritative "not found" and when it answered: the `now` (ms) passed to
+/// [`Engine::on_response`] with that answer. A query can finish much later, after
+/// waiting on other sources, so the finish time says nothing about this answer's age.
+pub type NotFoundAt = (Source, u64);
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
     Found {
@@ -29,14 +34,15 @@ pub enum Outcome {
         name: String,
         uuid: String,
         skin: SkinData,
-        /// Sources tried before `source` that have no usable skin for the name.
-        not_found_in: Vec<Source>,
+        /// Sources tried before `source` that have no usable skin for the name, each
+        /// with the time (ms) it answered.
+        not_found_in: Vec<NotFoundAt>,
     },
     /// Every source answered that it has no usable skin.
-    NotFound { not_found_in: Vec<Source> },
+    NotFound { not_found_in: Vec<NotFoundAt> },
     Failed {
         error: String,
-        not_found_in: Vec<Source>,
+        not_found_in: Vec<NotFoundAt>,
     },
 }
 
@@ -45,7 +51,7 @@ impl Outcome {
     /// 204/404, a name missing from the bulk answer, or a skin that is not signed or
     /// not vanilla. Transport errors, rate limits, other HTTP statuses and "busy" are
     /// not listed: they say nothing about the account.
-    pub fn not_found_in(&self) -> &[Source] {
+    pub fn not_found_in(&self) -> &[NotFoundAt] {
         match self {
             Outcome::Found { not_found_in, .. }
             | Outcome::NotFound { not_found_in }
@@ -63,7 +69,7 @@ struct Query {
     name: String,
     remaining: VecDeque<Source>,
     errors: Vec<String>,
-    not_found_in: Vec<Source>,
+    not_found_in: Vec<NotFoundAt>,
 }
 
 enum Stage {
@@ -230,7 +236,7 @@ impl Engine {
                 }
                 Ok(None) => {
                     if let Some(q) = self.queries.get_mut(&id) {
-                        q.not_found_in.push(key.0);
+                        q.not_found_in.push((key.0, now));
                     }
                     self.advance(id, now);
                 }
@@ -402,7 +408,8 @@ mod tests {
         })
     }
 
-    fn not_found(sources: &[Source]) -> Outcome {
+    /// Not found in each source, answered at the paired time.
+    fn not_found(sources: &[(Source, u64)]) -> Outcome {
         Outcome::NotFound {
             not_found_in: sources.to_vec(),
         }
@@ -511,7 +518,7 @@ mod tests {
         e.submit("Notch", &[Source::Mojang], 0).unwrap();
         let reqs = e.poll_requests(1000);
         e.on_response(reqs[0].0, status(204, None), 1000);
-        assert_eq!(e.take_finished()[0].1, not_found(&[Source::Mojang]));
+        assert_eq!(e.take_finished()[0].1, not_found(&[(Source::Mojang, 1000)]));
         assert_eq!(e.queued(), 0);
     }
 
@@ -576,7 +583,7 @@ mod tests {
             ok(r#"{"id":"069a79f444e94726a5befca90e38aaf5","name":"Notch","properties":[]}"#),
             1000,
         );
-        assert_eq!(e.take_finished()[0].1, not_found(&[Source::Mojang]));
+        assert_eq!(e.take_finished()[0].1, not_found(&[(Source::Mojang, 1000)]));
         assert_eq!(e.queued(), 0);
     }
 
@@ -711,7 +718,7 @@ mod tests {
             busy[0].1,
             Outcome::Failed {
                 error: "busy".into(),
-                not_found_in: vec![Source::Mojang],
+                not_found_in: vec![(Source::Mojang, 0)],
             }
         );
         assert_eq!(e.queued(), MAX_QUEUED - BATCH_SIZE);
@@ -823,7 +830,10 @@ mod tests {
         assert_eq!(batch.len(), 1);
         e.on_response(batch[0].0, ok(&ids(&["b"])), 1000);
         // "c" has no other source, "a" moves to Mojang, "b" gets its skin request.
-        assert_eq!(e.take_finished(), vec![(c, not_found(&[Source::Ely]))]);
+        assert_eq!(
+            e.take_finished(),
+            vec![(c, not_found(&[(Source::Ely, 1000)]))]
+        );
         let reqs = e.poll_requests(2000);
         assert_eq!(reqs.len(), 2);
         let mojang = reqs
@@ -925,7 +935,8 @@ mod tests {
                 ..
             } => assert_eq!(
                 (*source, not_found_in),
-                (Source::Mojang, &vec![Source::Ely])
+                // Stamped with the time Ely answered, not the time the query finished.
+                (Source::Mojang, &vec![(Source::Ely, 1000)])
             ),
             other => panic!("unexpected {other:?}"),
         }
@@ -980,7 +991,9 @@ mod tests {
         );
         answer_found(&mut e, 2000, "alice");
         match &e.take_finished()[0].1 {
-            Outcome::Found { not_found_in, .. } => assert_eq!(not_found_in, &vec![Source::Ely]),
+            Outcome::Found { not_found_in, .. } => {
+                assert_eq!(not_found_in, &vec![(Source::Ely, 1000)])
+            }
             other => panic!("unexpected {other:?}"),
         }
     }
@@ -996,7 +1009,7 @@ mod tests {
         e.on_response(reqs[0].0, status(404, None), 2000);
         assert_eq!(
             e.take_finished()[0].1,
-            not_found(&[Source::Ely, Source::Mojang])
+            not_found(&[(Source::Ely, 1000), (Source::Mojang, 2000)])
         );
 
         e.submit("Alice", &[Source::Ely, Source::Mojang], 3000)
@@ -1009,7 +1022,7 @@ mod tests {
             e.take_finished()[0].1,
             Outcome::Failed {
                 error: "mojang: timed out".into(),
-                not_found_in: vec![Source::Ely],
+                not_found_in: vec![(Source::Ely, 4000)],
             }
         );
     }

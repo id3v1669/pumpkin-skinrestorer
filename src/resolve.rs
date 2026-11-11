@@ -4,6 +4,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::config::Config;
+use crate::skin::skin_url;
 use crate::source::{SkinData, Source, valid_name};
 use crate::store::{Cache, Choice, PlayerRecord};
 
@@ -137,23 +138,17 @@ pub fn plan_login(
     }
 }
 
-/// Whether a skin found by a login lookup is the one `record`'s player gets at the next
-/// join: they are not locked, and the found skin is either their unblocked explicit
-/// choice or, in automatic mode, their own name's skin from an unblocked source.
-/// `found_name` is lowercase.
-pub fn result_applies(
-    record: &PlayerRecord,
-    own_name: &str,
-    found_source: Source,
-    found_name: &str,
-    cfg: &Config,
-) -> bool {
-    if record.locked || cfg.is_blocked(found_source, found_name) {
-        return false;
-    }
-    match &record.choice {
-        Choice::Skin { source, name } => *source == found_source && name == found_name,
-        Choice::Auto => found_name == own_name.to_ascii_lowercase(),
+/// Whether a player is told that a skin found by a login lookup is ready. `plan` is
+/// their login plan as it stands now, after the lookup updated the cache: the skin it
+/// applies must be the found one (`found_url`), and not the one already applied at
+/// their login (`applied_url`). Skins are compared by URL: the textures value carries a
+/// fresh timestamp.
+pub fn notice_due(plan: &LoginPlan, found_url: &str, applied_url: Option<&str>) -> bool {
+    match &plan.apply {
+        Apply::Skin(s) => {
+            skin_url(&s.value).as_deref() == Some(found_url) && applied_url != Some(found_url)
+        }
+        Apply::Steve | Apply::Keep => false,
     }
 }
 
@@ -541,57 +536,82 @@ mod tests {
         assert_ne!(ops.revision("a"), start);
     }
 
-    #[test]
-    fn result_applies_to_the_matching_choice() {
-        let cfg = Config::default();
-        let r = record(Choice::skin(Source::Mojang, "notch"));
-        assert!(result_applies(&r, "Alice", Source::Mojang, "notch", &cfg));
-        // Same name from another source is a different skin.
-        assert!(!result_applies(&r, "Alice", Source::Ely, "notch", &cfg));
+    /// A base64 `textures` value whose skin URL is `url`.
+    fn textures(url: &str) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .encode(format!(r#"{{"textures":{{"SKIN":{{"url":"{url}"}}}}}}"#))
+    }
+
+    fn plan(apply: Apply) -> LoginPlan {
+        LoginPlan {
+            apply,
+            lookup: None,
+            drop_choice: false,
+        }
     }
 
     #[test]
-    fn result_applies_to_the_own_name_in_auto() {
-        let cfg = Config::default();
+    fn no_notice_when_the_plan_applies_a_different_skin() {
+        let p = plan(skin(&textures("http://t/other")));
+        assert!(!notice_due(&p, "http://t/found", None));
+        assert!(!notice_due(&p, "http://t/found", Some("http://t/old")));
+    }
+
+    #[test]
+    fn no_notice_when_the_plan_is_steve_or_keep() {
+        for apply in [Apply::Steve, Apply::Keep] {
+            assert!(!notice_due(&plan(apply), "http://t/found", None));
+        }
+    }
+
+    #[test]
+    fn notice_when_the_plan_applies_the_found_skin_and_it_is_new() {
+        let p = plan(skin(&textures("http://t/found")));
+        assert!(notice_due(&p, "http://t/found", None));
+        assert!(notice_due(&p, "http://t/found", Some("http://t/old")));
+    }
+
+    #[test]
+    fn no_notice_when_the_found_skin_is_already_worn() {
+        let p = plan(skin(&textures("http://t/found")));
+        assert!(!notice_due(&p, "http://t/found", Some("http://t/found")));
+    }
+
+    #[test]
+    fn no_notice_when_the_planned_skin_has_no_url() {
+        assert!(!notice_due(
+            &plan(skin("not base64")),
+            "http://t/found",
+            None
+        ));
+    }
+
+    #[test]
+    fn ely_result_is_not_what_a_mojang_only_order_applies() {
+        // A lookup found the Ely skin and cached it, then a reload dropped Ely.
+        let cfg = parse(r#"source_order = ["mojang"]"#).unwrap();
+        let mut cache = Cache::default();
+        cache.put(Source::Ely, "alice", cached(&textures("http://t/ely"), 0));
         let r = record(Choice::Auto);
-        assert!(result_applies(&r, "Alice", Source::Ely, "alice", &cfg));
-        assert!(result_applies(&r, "Alice", Source::Mojang, "alice", &cfg));
-    }
+        let p = plan_login(Some(&r), "Alice", false, &cache, &cfg, 60);
+        assert_eq!(p.apply, Apply::Steve);
+        assert!(!notice_due(&p, "http://t/ely", None));
 
-    #[test]
-    fn result_does_not_apply_to_a_locked_player() {
-        let cfg = Config::default();
-        let mut r = record(Choice::skin(Source::Mojang, "notch"));
-        r.locked = true;
-        assert!(!result_applies(&r, "Alice", Source::Mojang, "notch", &cfg));
-        let mut r = record(Choice::Auto);
-        r.locked = true;
-        assert!(!result_applies(&r, "Alice", Source::Ely, "alice", &cfg));
-    }
-
-    #[test]
-    fn result_does_not_apply_after_the_choice_changed() {
-        let cfg = Config::default();
-        let r = record(Choice::skin(Source::Mojang, "jeb_"));
-        assert!(!result_applies(&r, "Alice", Source::Mojang, "notch", &cfg));
-        // A lookup for the own name does not apply to an explicit choice.
-        assert!(!result_applies(&r, "Alice", Source::Ely, "alice", &cfg));
-    }
-
-    #[test]
-    fn result_for_the_old_choice_does_not_apply_after_a_clear() {
-        let cfg = Config::default();
-        let r = record(Choice::Auto);
-        assert!(!result_applies(&r, "Alice", Source::Mojang, "notch", &cfg));
-    }
-
-    #[test]
-    fn blocked_result_does_not_apply() {
-        let cfg = parse(r#"blocked = ["mojang:notch", "ely:alice"]"#).unwrap();
-        let r = record(Choice::skin(Source::Mojang, "notch"));
-        assert!(!result_applies(&r, "Alice", Source::Mojang, "notch", &cfg));
-        let r = record(Choice::Auto);
-        assert!(!result_applies(&r, "Alice", Source::Ely, "alice", &cfg));
-        assert!(result_applies(&r, "Alice", Source::Mojang, "alice", &cfg));
+        // With Ely in the order the same result is the planned skin.
+        let p = plan_login(Some(&r), "Alice", false, &cache, &Config::default(), 60);
+        assert!(notice_due(&p, "http://t/ely", None));
+        // A profile skin outranks it.
+        let p = plan_login(Some(&r), "Alice", true, &cache, &Config::default(), 60);
+        assert!(!notice_due(&p, "http://t/ely", None));
+        // So does a cached skin from a higher-ranked source.
+        let cfg = parse(r#"source_order = ["mojang", "ely"]"#).unwrap();
+        cache.put(
+            Source::Mojang,
+            "alice",
+            cached(&textures("http://t/mojang"), 0),
+        );
+        let p = plan_login(Some(&r), "Alice", false, &cache, &cfg, 60);
+        assert!(!notice_due(&p, "http://t/ely", None));
     }
 }

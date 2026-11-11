@@ -163,6 +163,26 @@ impl Cache {
     pub fn remove(&mut self, source: Source, name: &str) -> bool {
         self.skins.remove(&skin_key(source, name)).is_some()
     }
+
+    /// Drops an entry that a "not found" answered at `answered_at_secs` (Unix seconds)
+    /// disproves: one fetched no later than that answer. An entry fetched after it is
+    /// newer knowledge and stays. True if an entry was dropped.
+    ///
+    /// `fetched_at` has whole-second resolution, so a fetch and an answer in the same
+    /// second cannot be ordered; the entry is treated as older and dropped. The cost of
+    /// guessing wrong that way is one more lookup, the other way a skin the source no
+    /// longer has keeps being applied until it expires.
+    pub fn remove_if_not_newer(
+        &mut self,
+        source: Source,
+        name: &str,
+        answered_at_secs: u64,
+    ) -> bool {
+        match self.get(source, name) {
+            Some(c) if c.fetched_at <= answered_at_secs => self.remove(source, name),
+            _ => false,
+        }
+    }
 }
 
 /// Reads a JSON state file. A missing file is empty state; a corrupt one is an error,
@@ -400,5 +420,41 @@ mod tests {
         assert_eq!(cache.get(Source::Ely, "alice"), None);
         assert_eq!(cache.get(Source::Mojang, "alice"), Some(&entry));
         assert!(!cache.remove(Source::Ely, "alice"));
+    }
+
+    fn fetched(at: u64) -> CachedSkin {
+        CachedSkin {
+            value: "v".into(),
+            signature: "s".into(),
+            uuid: "u".into(),
+            fetched_at: at,
+        }
+    }
+
+    #[test]
+    fn not_found_removes_an_entry_fetched_before_the_answer() {
+        let mut cache = Cache::default();
+        cache.put(Source::Ely, "alice", fetched(999));
+        cache.put(Source::Mojang, "alice", fetched(999));
+        assert!(cache.remove_if_not_newer(Source::Ely, "ALICE", 1000));
+        assert_eq!(cache.get(Source::Ely, "alice"), None);
+        assert_eq!(cache.get(Source::Mojang, "alice"), Some(&fetched(999)));
+        assert!(!cache.remove_if_not_newer(Source::Ely, "alice", 1000));
+    }
+
+    #[test]
+    fn not_found_keeps_an_entry_fetched_after_the_answer() {
+        let mut cache = Cache::default();
+        cache.put(Source::Ely, "alice", fetched(1001));
+        assert!(!cache.remove_if_not_newer(Source::Ely, "alice", 1000));
+        assert_eq!(cache.get(Source::Ely, "alice"), Some(&fetched(1001)));
+    }
+
+    #[test]
+    fn not_found_removes_an_entry_fetched_in_the_same_second() {
+        let mut cache = Cache::default();
+        cache.put(Source::Ely, "alice", fetched(1000));
+        assert!(cache.remove_if_not_newer(Source::Ely, "alice", 1000));
+        assert_eq!(cache.get(Source::Ely, "alice"), None);
     }
 }

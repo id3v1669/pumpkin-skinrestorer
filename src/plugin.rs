@@ -43,7 +43,7 @@ use crate::config::{self, Config, DEFAULT_CONFIG, skin_key};
 use crate::http;
 use crate::lookup::{Engine, Outcome, QueryId, ReqId};
 use crate::resolve::{
-    Apply, Cooldowns, Ops, Superseded, is_admin, may_commit, plan_login, result_applies,
+    Apply, Cooldowns, Ops, Superseded, is_admin, may_commit, notice_due, plan_login,
 };
 use crate::skin::{profile_component, skin_url, steve};
 use crate::source::{SkinData, Source};
@@ -109,6 +109,8 @@ struct LoginWaiter {
     /// Skin URL applied at their login, if any: a player is only told about a skin
     /// they are not already wearing.
     applied: Option<String>,
+    /// Whether their profile had a skin of its own at login.
+    has_own_skin: bool,
 }
 
 /// Host calls to make once the state borrow has ended.
@@ -322,6 +324,7 @@ fn on_login(player: &Player) {
                 player: id,
                 key,
                 applied,
+                has_own_skin,
             };
             if let Some((_, Purpose::Login { waiters, .. })) =
                 running.and_then(|q| s.purposes.get_mut(&q))
@@ -430,9 +433,12 @@ fn finish(
     now: u64,
 ) -> Vec<Effect> {
     // A source that no longer has a skin for the name must not keep winning from the
-    // cache.
-    for &source in outcome.not_found_in() {
-        if s.cache.remove(source, lookup_name) {
+    // cache. The answer may be old by now (the lookup went on to other sources): an
+    // entry fetched after it stays.
+    for &(source, answered_at_ms) in outcome.not_found_in() {
+        if s.cache
+            .remove_if_not_newer(source, lookup_name, answered_at_ms / 1000)
+        {
             s.cache_dirty = true;
         }
     }
@@ -547,15 +553,27 @@ fn finish(
             if let Outcome::Failed { error, .. } = &outcome {
                 warn_failed_lookup(s, lookup_name, error, now);
             }
-            if let Some((source, found_name, skin)) = &found {
-                // Compared by URL: the textures value carries a fresh timestamp.
-                let url = skin_url(&skin.value);
+            // Compared by URL: the textures value carries a fresh timestamp.
+            if let Some(url) = found
+                .as_ref()
+                .and_then(|(_, _, skin)| skin_url(&skin.value))
+            {
                 for waiter in waiters {
-                    // Only players who get this skin at their next join are told.
-                    let applies = s.players.players.get(&waiter.key).is_some_and(|record| {
-                        result_applies(record, &record.name, *source, found_name, &s.cfg)
+                    // Only players who get this skin at their next join are told: the
+                    // login decision is made again with the rules, record and cache as
+                    // they are now.
+                    let due = s.players.players.get(&waiter.key).is_some_and(|record| {
+                        let plan = plan_login(
+                            Some(record),
+                            &record.name,
+                            waiter.has_own_skin,
+                            &s.cache,
+                            &s.cfg,
+                            now / 1000,
+                        );
+                        notice_due(&plan, &url, waiter.applied.as_deref())
                     });
-                    if applies && (waiter.applied.is_none() || waiter.applied != url) {
+                    if due {
                         effects.push(Effect::TellPlayer(
                             waiter.player,
                             "Your skin is ready, rejoin to see it.".into(),
