@@ -27,11 +27,12 @@ impl Source {
         }
     }
 
-    /// Name-to-UUID lookups per bulk request.
-    pub fn batch_limit(self) -> usize {
+    /// Whether a skin is fetched by UUID, found first with a bulk name lookup. Ely.by
+    /// serves skins by name, so it needs no such step.
+    pub fn batched(self) -> bool {
         match self {
-            Source::Ely => 100,
-            Source::Mojang => 10,
+            Source::Ely => false,
+            Source::Mojang => true,
         }
     }
 }
@@ -64,27 +65,23 @@ pub struct HttpResponse {
     pub body: Vec<u8>,
 }
 
-/// Bulk name-to-UUID lookup for up to [`Source::batch_limit`] names.
-pub fn uuid_batch_request(source: Source, names: &[String]) -> HttpRequest {
-    debug_assert!(names.len() <= source.batch_limit());
+/// Names Mojang accepts in one bulk lookup.
+pub const MOJANG_BATCH_LIMIT: usize = 10;
+
+/// Mojang's bulk name-to-UUID lookup for up to [`MOJANG_BATCH_LIMIT`] names.
+pub fn uuid_batch_request(names: &[String]) -> HttpRequest {
+    debug_assert!(names.len() <= MOJANG_BATCH_LIMIT);
     let body = serde_json::to_vec(names).expect("a list of strings always serialises");
-    let (host, path) = match source {
-        Source::Ely => ("authserver.ely.by", "/api/profiles/minecraft"),
-        Source::Mojang => (
-            "api.minecraftservices.com",
-            "/minecraft/profile/lookup/bulk/byname",
-        ),
-    };
     HttpRequest {
         method: Method::Post,
-        host,
-        path: path.into(),
+        host: "api.minecraftservices.com",
+        path: "/minecraft/profile/lookup/bulk/byname".into(),
         body: Some(body),
     }
 }
 
 /// Skin request for one account. Ely.by is queried by name (`/textures/signed`, whose
-/// textures an unmodified client accepts), Mojang by UUID.
+/// textures an unmodified client accepts; `uuid` is unused), Mojang by UUID.
 pub fn skin_request(source: Source, name: &str, uuid: &str) -> HttpRequest {
     let (host, path) = match source {
         Source::Ely => ("skinsystem.ely.by", format!("/textures/signed/{name}")),
@@ -128,7 +125,7 @@ fn normal_uuid(id: &str) -> String {
         .collect()
 }
 
-/// Parses a bulk lookup answer into `(lowercase name, undashed lowercase uuid)` pairs.
+/// Parses Mojang's bulk lookup answer into `(lowercase name, undashed lowercase uuid)` pairs.
 /// Names that were not found are simply absent; entries with a malformed id or name are
 /// dropped.
 pub fn parse_uuid_batch(body: &[u8]) -> Result<Vec<(String, String)>, String> {
@@ -228,14 +225,13 @@ mod tests {
     #[test]
     fn batch_requests_post_a_json_list() {
         let names = vec!["Notch".to_string(), "jeb_".to_string()];
-        let req = uuid_batch_request(Source::Mojang, &names);
+        let req = uuid_batch_request(&names);
         assert_eq!(req.method, Method::Post);
         assert_eq!(req.host, "api.minecraftservices.com");
         assert_eq!(req.path, "/minecraft/profile/lookup/bulk/byname");
         assert_eq!(req.body.as_deref(), Some(&br#"["Notch","jeb_"]"#[..]));
-        let ely = uuid_batch_request(Source::Ely, &names);
-        assert_eq!(ely.host, "authserver.ely.by");
-        assert_eq!(ely.path, "/api/profiles/minecraft");
+        assert!(Source::Mojang.batched());
+        assert!(!Source::Ely.batched());
     }
 
     #[test]

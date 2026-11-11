@@ -32,17 +32,28 @@ pub struct Wanted {
 pub struct LoginPlan {
     pub apply: Apply,
     pub lookup: Option<Wanted>,
-    /// The stored choice became blocked: reset it to automatic; the caller
-    /// must also bump the player's revision (`Ops::bump`).
+    /// The stored choice became blocked, or its source recently answered that it has
+    /// no such skin: reset it to automatic; the caller must also bump the player's
+    /// revision (`Ops::bump`).
     pub drop_choice: bool,
 }
 
-/// The login steps from the design, using stored data only.
+/// What a joining player gets, decided from stored data only:
 ///
-/// An explicit choice is refreshed from its own source alone. In automatic
-/// mode the configured source order wins: the first cached, unblocked source
-/// is applied; if that entry is expired every unblocked source is looked up
-/// again, and if it is fresh only the sources ranked above it are.
+/// 1. Locked: Steve.
+/// 2. An explicit choice: its cached skin, refreshed from its own source alone once
+///    expired. A choice that is blocked, or that its source answered "not found" for
+///    less than `cache_minutes` ago, is dropped and steps 3-4 apply. Any other choice
+///    without a cached skin leaves the player with the automatic result of steps 3-4
+///    while the choice is looked up.
+/// 3. The skin the profile already has is kept.
+/// 4. Automatic: the configured source order wins. The first cached, unblocked source
+///    of the player's own name is applied; if that entry is expired every unblocked
+///    source is looked up again, and if it is fresh only the sources ranked above it
+///    are. Without any cached skin: Steve, and every unblocked source is looked up.
+///
+/// A source that answered "not found" for a name less than `cache_minutes` ago is not
+/// looked up again.
 pub fn plan_login(
     record: Option<&PlayerRecord>,
     own_name: &str,
@@ -52,6 +63,8 @@ pub fn plan_login(
     now_secs: u64,
 ) -> LoginPlan {
     let mut drop_choice = false;
+    // The lookup for an explicit choice that has no cached skin.
+    let mut chosen: Option<Wanted> = None;
     if let Some(r) = record {
         if r.locked {
             return LoginPlan {
@@ -68,35 +81,47 @@ pub fn plan_login(
                     name: name.clone(),
                     sources: vec![*source],
                 };
-                return match cache.get(*source, name) {
-                    Some(c) => LoginPlan {
-                        apply: Apply::Skin(c.skin()),
-                        lookup: c.is_expired(now_secs, cfg.cache_minutes).then_some(exact),
-                        drop_choice: false,
-                    },
-                    None => LoginPlan {
-                        apply: Apply::Steve,
-                        lookup: Some(exact),
-                        drop_choice: false,
-                    },
-                };
+                match cache.get(*source, name) {
+                    Some(c) => {
+                        return LoginPlan {
+                            apply: Apply::Skin(c.skin()),
+                            lookup: c.is_expired(now_secs, cfg.cache_minutes).then_some(exact),
+                            drop_choice: false,
+                        };
+                    }
+                    // The skin is gone: the player is automatic again.
+                    None if cache.is_missed(*source, name, now_secs, cfg.cache_minutes) => {
+                        drop_choice = true;
+                    }
+                    None => chosen = Some(exact),
+                }
             }
         }
     }
 
+    let (apply, automatic_lookup) = automatic(own_name, has_own_skin, cache, cfg, now_secs);
+    LoginPlan {
+        apply,
+        // Only the choice is looked up while it is pending.
+        lookup: chosen.or(automatic_lookup),
+        drop_choice,
+    }
+}
+
+/// Steps 3-4 of [`plan_login`]: what a player without a usable explicit choice gets, and
+/// the lookup for their own name.
+fn automatic(
+    own_name: &str,
+    has_own_skin: bool,
+    cache: &Cache,
+    cfg: &Config,
+    now_secs: u64,
+) -> (Apply, Option<Wanted>) {
     if has_own_skin {
-        return LoginPlan {
-            apply: Apply::Keep,
-            lookup: None,
-            drop_choice,
-        };
+        return (Apply::Keep, None);
     }
     if !valid_name(own_name) {
-        return LoginPlan {
-            apply: Apply::Steve,
-            lookup: None,
-            drop_choice,
-        };
+        return (Apply::Steve, None);
     }
     let sources: Vec<Source> = cfg
         .source_order
@@ -104,38 +129,31 @@ pub fn plan_login(
         .copied()
         .filter(|s| !cfg.is_blocked(*s, own_name))
         .collect();
-    if sources.is_empty() {
-        return LoginPlan {
-            apply: Apply::Steve,
-            lookup: None,
-            drop_choice,
-        };
-    }
-    let name = own_name.to_ascii_lowercase();
+    // A lookup in those of `list` that did not answer "not found" recently.
+    let wanted = |list: &[Source]| {
+        let sources: Vec<Source> = list
+            .iter()
+            .copied()
+            .filter(|s| !cache.is_missed(*s, own_name, now_secs, cfg.cache_minutes))
+            .collect();
+        (!sources.is_empty()).then(|| Wanted {
+            name: own_name.to_ascii_lowercase(),
+            sources,
+        })
+    };
     for (i, &source) in sources.iter().enumerate() {
         if let Some(c) = cache.get(source, own_name) {
             // The source order wins: an expired hit rechecks every source, a
             // fresh one only the sources ranked above it.
             let recheck = if c.is_expired(now_secs, cfg.cache_minutes) {
-                sources.clone()
+                &sources[..]
             } else {
-                sources[..i].to_vec()
+                &sources[..i]
             };
-            return LoginPlan {
-                apply: Apply::Skin(c.skin()),
-                lookup: (!recheck.is_empty()).then_some(Wanted {
-                    name,
-                    sources: recheck,
-                }),
-                drop_choice,
-            };
+            return (Apply::Skin(c.skin()), wanted(recheck));
         }
     }
-    LoginPlan {
-        apply: Apply::Steve,
-        lookup: Some(Wanted { name, sources }),
-        drop_choice,
-    }
+    (Apply::Steve, wanted(&sources))
 }
 
 /// Whether a player is told that a skin found by a login lookup is ready. `plan` is
@@ -313,18 +331,92 @@ mod tests {
     }
 
     #[test]
-    fn uncached_choice_gets_steve_and_a_lookup() {
+    fn uncached_choice_gets_the_automatic_skin_and_its_own_lookup() {
         let r = record(Choice::skin(Source::Ely, "notch"));
-        let p = plan_login(
-            Some(&r),
-            "Alice",
-            true,
-            &Cache::default(),
-            &Config::default(),
-            0,
+        let cfg = Config::default();
+        let exact = Some(Wanted {
+            name: "notch".into(),
+            sources: vec![Source::Ely],
+        });
+        // Nothing stored at all: Steve.
+        let p = plan_login(Some(&r), "Alice", false, &Cache::default(), &cfg, 0);
+        assert_eq!(
+            (p.apply, p.lookup, p.drop_choice),
+            (Apply::Steve, exact.clone(), false)
         );
+        // The profile's own skin is kept meanwhile.
+        let p = plan_login(Some(&r), "Alice", true, &Cache::default(), &cfg, 0);
+        assert_eq!((p.apply, p.lookup), (Apply::Keep, exact.clone()));
+        // Or the cached skin of the player's own name; only the choice is looked up.
+        let mut cache = Cache::default();
+        cache.put(Source::Mojang, "alice", cached("own", 0));
+        let p = plan_login(Some(&r), "Alice", false, &cache, &cfg, 60);
+        assert_eq!((p.apply, p.lookup), (skin("own"), exact));
+    }
+
+    #[test]
+    fn a_recently_missed_choice_is_dropped_and_the_own_name_looked_up() {
+        // Someone else's lookup found out that the chosen skin is gone.
+        let r = record(Choice::skin(Source::Ely, "notch"));
+        let cfg = Config::default();
+        let mut cache = Cache::default();
+        cache.put_miss(Source::Ely, "notch", 0);
+        let p = plan_login(Some(&r), "Alice", false, &cache, &cfg, 60);
+        assert!(p.drop_choice);
         assert_eq!(p.apply, Apply::Steve);
-        assert_eq!(p.lookup.unwrap().sources, vec![Source::Ely]);
+        assert_eq!(
+            p.lookup,
+            Some(Wanted {
+                name: "alice".into(),
+                sources: vec![Source::Ely, Source::Mojang]
+            })
+        );
+        // With a profile skin there is nothing to look up.
+        let p = plan_login(Some(&r), "Alice", true, &cache, &cfg, 60);
+        assert_eq!(
+            (p.apply, p.lookup, p.drop_choice),
+            (Apply::Keep, None, true)
+        );
+        // An expired miss says nothing: the choice is kept and looked up.
+        let p = plan_login(Some(&r), "Alice", false, &cache, &cfg, 15 * 60);
+        assert!(!p.drop_choice);
+        assert_eq!(p.lookup.unwrap().name, "notch");
+    }
+
+    #[test]
+    fn auto_skips_sources_that_recently_had_nothing() {
+        let cfg = Config::default();
+        let both = Some(Wanted {
+            name: "alice".into(),
+            sources: vec![Source::Ely, Source::Mojang],
+        });
+        let mut cache = Cache::default();
+        cache.put_miss(Source::Ely, "alice", 0);
+        let p = plan_login(None, "Alice", false, &cache, &cfg, 60);
+        assert_eq!(p.apply, Apply::Steve);
+        assert_eq!(
+            p.lookup,
+            Some(Wanted {
+                name: "alice".into(),
+                sources: vec![Source::Mojang]
+            })
+        );
+        // Nothing anywhere: no lookup until a miss expires.
+        cache.put_miss(Source::Mojang, "alice", 0);
+        let p = plan_login(None, "Alice", false, &cache, &cfg, 60);
+        assert_eq!((p.apply, p.lookup), (Apply::Steve, None));
+        let p = plan_login(None, "Alice", false, &cache, &cfg, 15 * 60);
+        assert_eq!((p.apply, p.lookup), (Apply::Steve, both));
+    }
+
+    #[test]
+    fn a_lower_priority_hit_does_not_recheck_a_missed_source() {
+        let cfg = Config::default();
+        let mut cache = Cache::default();
+        cache.put(Source::Mojang, "alice", cached("mojang", 0));
+        cache.put_miss(Source::Ely, "alice", 0);
+        let p = plan_login(None, "Alice", false, &cache, &cfg, 60);
+        assert_eq!((p.apply, p.lookup), (skin("mojang"), None));
     }
 
     #[test]

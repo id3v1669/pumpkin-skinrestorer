@@ -5,21 +5,23 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use crate::source::{
-    HttpRequest, HttpResponse, SkinData, Source, parse_skin, parse_uuid_batch, skin_request,
-    uuid_batch_request,
+    HttpRequest, HttpResponse, MOJANG_BATCH_LIMIT, SkinData, Source, parse_skin, parse_uuid_batch,
+    skin_request, uuid_batch_request,
 };
 
 pub type QueryId = u64;
 pub type ReqId = u64;
 
 /// Names per bulk request, and the window after which a partial batch is sent anyway.
-pub const BATCH_SIZE: usize = 10;
+pub const BATCH_SIZE: usize = MOJANG_BATCH_LIMIT;
 pub const BATCH_WINDOW_MS: u64 = 1000;
 pub const MAX_IN_FLIGHT: usize = 16;
 /// Distinct lookups (source + name) queued or running at once.
 pub const MAX_QUEUED: usize = 256;
 /// Pause after HTTP 429 without a `Retry-After` header.
 pub const DEFAULT_BACKOFF_SECS: u64 = 60;
+/// Longest pause a `Retry-After` header can ask for.
+pub const MAX_BACKOFF_SECS: u64 = 3600;
 
 /// A source's authoritative "not found" and its place in the engine's order of answers
 /// (the engine counts every answer it processes). A query can finish much later, after waiting on other
@@ -33,6 +35,7 @@ pub enum Outcome {
         source: Source,
         /// Lowercase account name.
         name: String,
+        /// Account UUID at the source; empty for Ely.by, which is not asked for it.
         uuid: String,
         skin: SkinData,
         /// Sources tried before `source` that have no usable skin for the name, each
@@ -97,9 +100,12 @@ pub struct Engine {
     next_id: u64,
     queries: HashMap<QueryId, Query>,
     keys: BTreeMap<Key, KeyState>,
-    /// Keys waiting for a bulk name lookup, per source, with the time the first one
-    /// was queued.
+    /// Keys waiting for a bulk name lookup, per batched source, with the time the first
+    /// one was queued.
     pending: BTreeMap<Source, (u64, Vec<Key>)>,
+    /// Keys whose bulk lookup was refused as a bad request: each is asked again on its
+    /// own, so that one name the source rejects cannot fail the others.
+    alone: VecDeque<Key>,
     requests: HashMap<ReqId, Req>,
     backoff_until: HashMap<Source, u64>,
     finished: Vec<(QueryId, Outcome)>,
@@ -203,6 +209,20 @@ impl Engine {
                 }
                 continue;
             }
+            if !source.batched() {
+                // Asked by name: straight to the skin request.
+                let stage = Stage::WantSkin {
+                    uuid: String::new(),
+                };
+                self.keys.insert(
+                    key,
+                    KeyState {
+                        stage,
+                        waiters: vec![id],
+                    },
+                );
+                return;
+            }
             self.keys.insert(
                 key.clone(),
                 KeyState {
@@ -298,12 +318,32 @@ impl Engine {
             }
             let names: Vec<String> = batch.iter().map(|k| k.1.clone()).collect();
             let id = self.id();
-            out.push((id, uuid_batch_request(source, &names)));
+            out.push((id, uuid_batch_request(&names)));
             self.requests.insert(
                 id,
                 Req::Batch {
                     source,
                     keys: batch,
+                },
+            );
+        }
+
+        while self.requests.len() < MAX_IN_FLIGHT {
+            let Some(key) = self.alone.pop_front() else {
+                break;
+            };
+            if self.paused(key.0, now) {
+                let seq = self.next_answer_seq();
+                self.finish_key(&key, Err("rate limited".into()), seq, now);
+                continue;
+            }
+            let id = self.id();
+            out.push((id, uuid_batch_request(std::slice::from_ref(&key.1))));
+            self.requests.insert(
+                id,
+                Req::Batch {
+                    source: key.0,
+                    keys: vec![key],
                 },
             );
         }
@@ -336,7 +376,10 @@ impl Engine {
     }
 
     fn note_rate_limit(&mut self, source: Source, response: &HttpResponse, now: u64) {
-        let secs = response.retry_after.unwrap_or(DEFAULT_BACKOFF_SECS);
+        let secs = response
+            .retry_after
+            .unwrap_or(DEFAULT_BACKOFF_SECS)
+            .min(MAX_BACKOFF_SECS);
         // Never shortens a pause that is already running.
         let until = now.saturating_add(secs.saturating_mul(1000));
         let e = self.backoff_until.entry(source).or_insert(0);
@@ -352,6 +395,12 @@ impl Engine {
         let seq = self.next_answer_seq();
         match req {
             Req::Batch { source, keys } => {
+                // A bad request may be caused by a single name: ask for each alone.
+                // On its own, a refused name is an error, not a "not found".
+                if keys.len() > 1 && matches!(&result, Ok(r) if r.status == 400) {
+                    self.alone.extend(keys);
+                    return;
+                }
                 let found = match result {
                     Err(e) => Err(e),
                     Ok(r) if r.status == 429 => {
@@ -451,20 +500,22 @@ mod tests {
         )
     }
 
-    /// Drives one source through the batch and skin step for `name`.
+    /// Drives one source through the name lookup (Mojang only) and the skin request for
+    /// `name`.
     fn answer_found(e: &mut Engine, now: u64, name: &str) {
-        let reqs = e.poll_requests(now);
+        let mut reqs = e.poll_requests(now);
         assert_eq!(reqs.len(), 1);
-        assert_eq!(reqs[0].1.method, Method::Post);
-        e.on_response(
-            reqs[0].0,
-            ok(&format!(
-                r#"[{{"id":"069a79f444e94726a5befca90e38aaf5","name":"{name}"}}]"#
-            )),
-            now,
-        );
-        let reqs = e.poll_requests(now);
-        assert_eq!(reqs.len(), 1);
+        if reqs[0].1.method == Method::Post {
+            e.on_response(
+                reqs[0].0,
+                ok(&format!(
+                    r#"[{{"id":"069a79f444e94726a5befca90e38aaf5","name":"{name}"}}]"#
+                )),
+                now,
+            );
+            reqs = e.poll_requests(now);
+            assert_eq!(reqs.len(), 1);
+        }
         assert_eq!(reqs[0].1.method, Method::Get);
         e.on_response(reqs[0].0, ok(&profile_body()), now);
     }
@@ -493,7 +544,7 @@ mod tests {
     fn found_skin_finishes_the_query() {
         let mut e = Engine::new();
         let q = e
-            .submit("Notch", &[Source::Ely, Source::Mojang], 0)
+            .submit("Notch", &[Source::Mojang, Source::Ely], 0)
             .unwrap();
         answer_found(&mut e, 1000, "notch");
         let done = e.take_finished();
@@ -505,7 +556,7 @@ mod tests {
             } => {
                 assert_eq!(
                     (*source, name.as_str(), uuid.as_str()),
-                    (Source::Ely, "notch", "069a79f444e94726a5befca90e38aaf5")
+                    (Source::Mojang, "notch", "069a79f444e94726a5befca90e38aaf5")
                 );
             }
             other => panic!("unexpected {other:?}"),
@@ -514,13 +565,102 @@ mod tests {
     }
 
     #[test]
+    fn ely_goes_straight_to_the_skin_request() {
+        let mut e = Engine::new();
+        e.submit("Notch", &[Source::Ely], 0).unwrap();
+        // No name lookup and no batch window.
+        let reqs = e.poll_requests(0);
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].1.method, Method::Get);
+        assert_eq!(
+            (reqs[0].1.host, reqs[0].1.path.as_str()),
+            ("skinsystem.ely.by", "/textures/signed/notch")
+        );
+        e.on_response(reqs[0].0, ok(&profile_body()), 0);
+        match &e.take_finished()[0].1 {
+            Outcome::Found {
+                source, name, uuid, ..
+            } => assert_eq!(
+                (*source, name.as_str(), uuid.as_str()),
+                (Source::Ely, "notch", "")
+            ),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(e.queued(), 0);
+    }
+
+    #[test]
+    fn refused_batch_is_asked_again_name_by_name() {
+        let mut e = Engine::new();
+        let a = e.submit("a", &[Source::Mojang], 0).unwrap();
+        let b = e.submit("b", &[Source::Mojang], 0).unwrap();
+        let batch = e.poll_requests(1000);
+        assert_eq!(batch.len(), 1);
+        e.on_response(batch[0].0, status(400, None), 1000);
+        assert!(e.take_finished().is_empty());
+        // One request per name, without waiting for another window.
+        let alone = e.poll_requests(1000);
+        assert_eq!(alone.len(), 2);
+        let names = |r: &HttpRequest| -> Vec<String> {
+            serde_json::from_slice(r.body.as_ref().unwrap()).unwrap()
+        };
+        assert_eq!(names(&alone[0].1), vec!["a".to_string()]);
+        assert_eq!(names(&alone[1].1), vec!["b".to_string()]);
+        // "a" is the name Mojang refuses: an error, not a "not found".
+        e.on_response(alone[0].0, status(400, None), 1000);
+        assert_eq!(e.take_finished(), vec![(a, failed("mojang: HTTP 400"))]);
+        // "b" is unaffected.
+        e.on_response(alone[1].0, ok(&ids(&["b"])), 1000);
+        let skins = e.poll_requests(1000);
+        assert_eq!(skins.len(), 1);
+        e.on_response(skins[0].0, ok(&profile_body()), 1000);
+        let done = e.take_finished();
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].0, b);
+        assert!(matches!(done[0].1, Outcome::Found { .. }));
+        assert_eq!(e.queued(), 0);
+    }
+
+    #[test]
+    fn a_rate_limit_while_asking_alone_fails_only_that_name() {
+        let mut e = Engine::new();
+        e.submit("a", &[Source::Mojang], 0).unwrap();
+        e.submit("b", &[Source::Mojang], 0).unwrap();
+        e.submit("c", &[Source::Mojang], 0).unwrap();
+        let batch = e.poll_requests(1000);
+        e.on_response(batch[0].0, status(400, None), 1000);
+        let alone = e.poll_requests(1000);
+        assert_eq!(alone.len(), 3);
+        e.on_response(alone[0].0, status(400, None), 1000);
+        assert_eq!(e.take_finished().len(), 1);
+        e.on_response(alone[1].0, status(429, Some(30)), 1000);
+        assert_eq!(e.take_finished().len(), 1);
+        assert_eq!(e.queued(), 1);
+    }
+
+    #[test]
+    fn retry_after_is_capped() {
+        let mut e = Engine::new();
+        e.submit("a", &[Source::Ely], 0).unwrap();
+        let reqs = e.poll_requests(0);
+        e.on_response(reqs[0].0, status(429, Some(u64::MAX)), 1000);
+        e.take_finished();
+        let end = 1000 + MAX_BACKOFF_SECS * 1000;
+        e.submit("b", &[Source::Ely], end - 1).unwrap();
+        assert_eq!(e.take_finished()[0].1, failed("ely is rate limited"));
+        e.submit("b", &[Source::Ely], end).unwrap();
+        assert!(e.take_finished().is_empty());
+        assert_eq!(e.poll_requests(end).len(), 1);
+    }
+
+    #[test]
     fn not_found_moves_to_the_next_source() {
         let mut e = Engine::new();
         e.submit("Notch", &[Source::Ely, Source::Mojang], 0)
             .unwrap();
         let reqs = e.poll_requests(1000);
-        assert_eq!(reqs[0].1.host, "authserver.ely.by");
-        e.on_response(reqs[0].0, ok("[]"), 1000);
+        assert_eq!(reqs[0].1.host, "skinsystem.ely.by");
+        e.on_response(reqs[0].0, status(204, None), 1000);
         assert!(e.take_finished().is_empty());
         answer_found(&mut e, 2000, "notch");
         assert!(matches!(
@@ -676,7 +816,7 @@ mod tests {
         let mut e = Engine::new();
         e.submit("a", &[Source::Mojang], 0).unwrap();
         let reqs = e.poll_requests(1000);
-        e.on_response(reqs[0].0, status(429, Some(u64::MAX)), 1000);
+        e.on_response(reqs[0].0, status(429, Some(u64::MAX)), u64::MAX - 10);
         assert_eq!(e.take_finished()[0].1, failed("mojang: rate limited"));
         e.submit("b", &[Source::Mojang], u64::MAX - 1).unwrap();
         assert!(matches!(e.take_finished()[0].1, Outcome::Failed { .. }));
@@ -843,25 +983,28 @@ mod tests {
     #[test]
     fn names_missing_from_a_batch_answer_move_on() {
         let mut e = Engine::new();
-        e.submit("a", &[Source::Ely, Source::Mojang], 0).unwrap();
-        e.submit("b", &[Source::Ely], 0).unwrap();
-        let c = e.submit("c", &[Source::Ely], 0).unwrap();
+        e.submit("a", &[Source::Mojang, Source::Ely], 0).unwrap();
+        e.submit("b", &[Source::Mojang], 0).unwrap();
+        let c = e.submit("c", &[Source::Mojang], 0).unwrap();
         let batch = e.poll_requests(1000);
         assert_eq!(batch.len(), 1);
         e.on_response(batch[0].0, ok(&ids(&["b"])), 1000);
-        // "c" has no other source, "a" moves to Mojang, "b" gets its skin request.
-        assert_eq!(e.take_finished(), vec![(c, not_found(&[(Source::Ely, 1)]))]);
-        let reqs = e.poll_requests(2000);
+        // "c" has no other source, "a" moves to Ely.by, "b" gets its skin request.
+        assert_eq!(
+            e.take_finished(),
+            vec![(c, not_found(&[(Source::Mojang, 1)]))]
+        );
+        let reqs = e.poll_requests(1000);
         assert_eq!(reqs.len(), 2);
-        let mojang = reqs
-            .iter()
-            .find(|(_, r)| r.host == "api.minecraftservices.com")
-            .expect("name lookup at Mojang");
-        let names: Vec<String> = serde_json::from_slice(mojang.1.body.as_ref().unwrap()).unwrap();
-        assert_eq!(names, vec!["a".to_string()]);
         assert!(
             reqs.iter()
-                .any(|(_, r)| r.host == "skinsystem.ely.by" && r.path.ends_with("/b"))
+                .any(|(_, r)| r.host == "skinsystem.ely.by" && r.path.ends_with("/a"))
+        );
+        assert_eq!(
+            reqs.iter()
+                .find(|(_, r)| r.host == "sessionserver.mojang.com")
+                .map(|(id, _)| *id),
+            Some(skin_req_for(&reqs, "b"))
         );
     }
 
@@ -999,8 +1142,6 @@ mod tests {
         e.submit("Alice", &[Source::Ely, Source::Mojang], 0)
             .unwrap();
         let reqs = e.poll_requests(1000);
-        e.on_response(reqs[0].0, ok(&ids(&["alice"])), 1000);
-        let reqs = e.poll_requests(1000);
         e.on_response(
             reqs[0].0,
             ok(r#"{"id":"u","name":"n","properties":[]}"#),
@@ -1009,7 +1150,7 @@ mod tests {
         answer_found(&mut e, 2000, "alice");
         match &e.take_finished()[0].1 {
             Outcome::Found { not_found_in, .. } => {
-                assert_eq!(not_found_in, &vec![(Source::Ely, 2)])
+                assert_eq!(not_found_in, &vec![(Source::Ely, 1)])
             }
             other => panic!("unexpected {other:?}"),
         }
@@ -1021,7 +1162,7 @@ mod tests {
         e.submit("Alice", &[Source::Ely, Source::Mojang], 0)
             .unwrap();
         let reqs = e.poll_requests(1000);
-        e.on_response(reqs[0].0, ok("[]"), 1000);
+        e.on_response(reqs[0].0, status(204, None), 1000);
         let reqs = e.poll_requests(2000);
         e.on_response(reqs[0].0, status(404, None), 2000);
         assert_eq!(
@@ -1032,7 +1173,7 @@ mod tests {
         e.submit("Alice", &[Source::Ely, Source::Mojang], 3000)
             .unwrap();
         let reqs = e.poll_requests(4000);
-        e.on_response(reqs[0].0, ok("[]"), 4000);
+        e.on_response(reqs[0].0, status(204, None), 4000);
         let reqs = e.poll_requests(5000);
         e.on_response(reqs[0].0, Err("timed out".into()), 5000);
         assert_eq!(
@@ -1131,25 +1272,22 @@ mod tests {
             .submit("Alice", &[Source::Ely, Source::Mojang], now)
             .unwrap();
         let reqs = e.poll_requests(2 * now);
-        assert_eq!(reqs[0].1.host, "authserver.ely.by");
+        assert_eq!(reqs[0].1.host, "skinsystem.ely.by");
         e.on_response(reqs[0].0, status(204, None), now);
         assert!(e.take_finished().is_empty());
-        // B: the same Ely name, submitted afterwards, is batched and answered with a
-        // skin while A is still waiting.
+        // B: the same Ely name, submitted afterwards, is answered with a skin while A
+        // is still waiting.
         let b = e.submit("Alice", &[Source::Ely], now).unwrap();
         let reqs = e.poll_requests(2 * now);
         let ely = reqs
             .iter()
-            .find(|(_, r)| r.host == "authserver.ely.by")
-            .expect("name lookup at Ely.by");
+            .find(|(_, r)| r.host == "skinsystem.ely.by")
+            .expect("skin request at Ely.by");
         let mojang = reqs
             .iter()
             .find(|(_, r)| r.host == "api.minecraftservices.com")
             .expect("name lookup at Mojang");
-        e.on_response(ely.0, ok(&ids(&["alice"])), now);
-        let skin = e.poll_requests(now);
-        assert_eq!(skin.len(), 1);
-        e.on_response(skin[0].0, ok(&profile_body()), now);
+        e.on_response(ely.0, ok(&profile_body()), now);
         let done = e.take_finished();
         assert_eq!(done.len(), 1);
         assert_eq!(done[0].0, b);

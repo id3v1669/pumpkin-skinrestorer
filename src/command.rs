@@ -153,9 +153,140 @@ pub fn parse_skull(args: &str) -> Result<(SkinSpec, Option<String>), String> {
     }
 }
 
+const OPEN_SUBCOMMANDS: [&str; 7] = [
+    "set", "clear", "update", "status", "history", "undo", "help",
+];
+const ADMIN_SUBCOMMANDS: [&str; 5] = ["lock", "unlock", "block", "unblock", "reload"];
+const SOURCE_PREFIXES: [&str; 2] = ["ely:", "mojang:"];
+
+/// Splits the typed arguments into the finished words (with their whitespace) and the
+/// word being typed, which is empty after a space.
+fn split_last_word(input: &str) -> (&str, &str) {
+    let cut = input.trim_end_matches(|c: char| !c.is_whitespace()).len();
+    input.split_at(cut)
+}
+
+/// The candidates that continue the word being typed, each as the whole argument text:
+/// the server replaces everything typed after the command name with a suggestion.
+fn completions<S: AsRef<str>>(input: &str, candidates: impl IntoIterator<Item = S>) -> Vec<String> {
+    let (head, typed) = split_last_word(input);
+    let typed = typed.to_ascii_lowercase();
+    candidates
+        .into_iter()
+        .filter(|c| {
+            let c = c.as_ref().to_ascii_lowercase();
+            c.starts_with(&typed) && c != typed
+        })
+        .map(|c| format!("{head}{}", c.as_ref()))
+        .collect()
+}
+
+/// Tab completions for the arguments of `/skin` typed so far: subcommands, source
+/// prefixes and, for admins, the names of online players.
+pub fn suggest_skin(input: &str, players: &[String], admin: bool) -> Vec<String> {
+    let (head, _) = split_last_word(input);
+    let words: Vec<String> = head
+        .split_whitespace()
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let words: Vec<&str> = words.iter().map(String::as_str).collect();
+    match words.as_slice() {
+        [] => {
+            let admin_only = if admin { &ADMIN_SUBCOMMANDS[..] } else { &[] };
+            completions(input, OPEN_SUBCOMMANDS.iter().chain(admin_only))
+        }
+        ["set"] => completions(input, SOURCE_PREFIXES),
+        ["block" | "unblock"] if admin => completions(input, SOURCE_PREFIXES),
+        ["set", _] | ["clear" | "update" | "status" | "lock" | "unlock"] if admin => {
+            completions(input, players)
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Tab completions for the arguments of `/skull` typed so far.
+pub fn suggest_skull(input: &str, players: &[String], admin: bool) -> Vec<String> {
+    let (head, _) = split_last_word(input);
+    match head.split_whitespace().count() {
+        0 => completions(input, SOURCE_PREFIXES),
+        1 if admin => completions(input, players),
+        _ => Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn online() -> Vec<String> {
+        vec!["Alice".to_string(), "alex".to_string(), "Bob".to_string()]
+    }
+
+    #[test]
+    fn subcommands_are_suggested_by_prefix() {
+        let all = suggest_skin("", &online(), false);
+        assert_eq!(all, OPEN_SUBCOMMANDS.map(String::from).to_vec());
+        assert_eq!(suggest_skin("s", &online(), false), ["set", "status"]);
+        assert_eq!(suggest_skin("U", &online(), false), ["update", "undo"]);
+        // Admin subcommands only for admins.
+        assert!(suggest_skin("lo", &online(), false).is_empty());
+        assert_eq!(suggest_skin("lo", &online(), true), ["lock"]);
+        assert_eq!(
+            suggest_skin("un", &online(), true),
+            ["undo", "unlock", "unblock"]
+        );
+        // A finished word is not suggested again.
+        assert!(suggest_skin("history", &online(), false).is_empty());
+        assert!(suggest_skin("dance", &online(), true).is_empty());
+    }
+
+    #[test]
+    fn suggestions_are_the_whole_argument_text() {
+        assert_eq!(
+            suggest_skin("set ", &online(), false),
+            ["set ely:", "set mojang:"]
+        );
+        assert_eq!(suggest_skin("SET  m", &online(), false), ["SET  mojang:"]);
+        assert_eq!(
+            suggest_skin("set Notch a", &online(), true),
+            ["set Notch Alice", "set Notch alex"]
+        );
+        assert_eq!(suggest_skin("lock b", &online(), true), ["lock Bob"]);
+        assert_eq!(
+            suggest_skin("block ", &online(), true),
+            ["block ely:", "block mojang:"]
+        );
+    }
+
+    #[test]
+    fn players_are_suggested_to_admins_only() {
+        for input in [
+            "set Notch ",
+            "clear ",
+            "update ",
+            "status ",
+            "lock ",
+            "unlock ",
+        ] {
+            assert!(suggest_skin(input, &online(), false).is_empty(), "{input}");
+            assert_eq!(suggest_skin(input, &online(), true).len(), 3, "{input}");
+        }
+        assert!(suggest_skin("block ", &online(), false).is_empty());
+        // Nothing after the last argument.
+        assert!(suggest_skin("set Notch Bob ", &online(), true).is_empty());
+        assert!(suggest_skin("history ", &online(), true).is_empty());
+        assert!(suggest_skin("reload ", &online(), true).is_empty());
+    }
+
+    #[test]
+    fn skull_suggestions() {
+        assert_eq!(suggest_skull("", &online(), false), ["ely:", "mojang:"]);
+        assert_eq!(suggest_skull("e", &online(), false), ["ely:"]);
+        assert!(suggest_skull("ely:No", &online(), false).is_empty());
+        assert!(suggest_skull("Notch ", &online(), false).is_empty());
+        assert_eq!(suggest_skull("Notch b", &online(), true), ["Notch Bob"]);
+        assert!(suggest_skull("Notch Bob ", &online(), true).is_empty());
+    }
 
     #[test]
     fn specs_parse_with_and_without_prefix() {

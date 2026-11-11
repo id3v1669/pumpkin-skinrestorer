@@ -26,6 +26,12 @@ history_length = 36
 blocked = []
 "#;
 
+/// Values of keys the file leaves out; [`DEFAULT_CONFIG`] spells out the same ones.
+const DEFAULT_SOURCE_ORDER: [Source; 2] = [Source::Ely, Source::Mojang];
+const DEFAULT_CACHE_MINUTES: i64 = 15;
+const DEFAULT_ADMIN_OP_LEVEL: i64 = 4;
+const DEFAULT_HISTORY_LENGTH: i64 = 36;
+
 /// Every key `config.toml` may contain.
 const KEYS: [&str; 6] = [
     "source_order",
@@ -144,7 +150,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
         source_order.push(source);
     }
     if doc.get("source_order").is_none() {
-        source_order = vec![Source::Ely, Source::Mojang];
+        source_order = DEFAULT_SOURCE_ORDER.to_vec();
     }
     if source_order.is_empty() {
         return Err("`source_order` must list at least one source".into());
@@ -166,10 +172,11 @@ pub fn parse(text: &str) -> Result<Config, String> {
 
     Ok(Config {
         source_order,
-        cache_minutes: integer(&doc, "cache_minutes", 15, (1, 525_600))? as u64,
-        admin_op_level: integer(&doc, "admin_op_level", 4, (0, 4))? as u8,
+        cache_minutes: integer(&doc, "cache_minutes", DEFAULT_CACHE_MINUTES, (1, 525_600))? as u64,
+        admin_op_level: integer(&doc, "admin_op_level", DEFAULT_ADMIN_OP_LEVEL, (0, 4))? as u8,
         admins,
-        history_length: integer(&doc, "history_length", 36, (0, 1000))? as usize,
+        history_length: integer(&doc, "history_length", DEFAULT_HISTORY_LENGTH, (0, 1000))?
+            as usize,
         blocked,
     })
 }

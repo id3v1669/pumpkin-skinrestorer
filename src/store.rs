@@ -144,10 +144,22 @@ impl CachedSkin {
     }
 }
 
+/// Entries (skins and misses) this old are dropped, unless `cache_minutes` is longer.
+pub const CACHE_KEEP_SECS: u64 = 30 * 24 * 60 * 60;
+
+/// How long a cache entry is kept before [`Cache::evict`] drops it.
+pub fn keep_secs(cache_minutes: u64) -> u64 {
+    CACHE_KEEP_SECS.max(cache_minutes.saturating_mul(60))
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cache {
     /// Keyed by `source:lowercase-name`.
     pub skins: BTreeMap<String, CachedSkin>,
+    /// Names a source answered "not found" for, with the Unix seconds of the answer.
+    /// Keyed like `skins`; a key is in at most one of the two maps.
+    #[serde(default)]
+    pub misses: BTreeMap<String, u64>,
 }
 
 impl Cache {
@@ -155,19 +167,42 @@ impl Cache {
         self.skins.get(&skin_key(source, name))
     }
 
+    /// Stores a found skin; it replaces a miss.
     pub fn put(&mut self, source: Source, name: &str, skin: CachedSkin) {
-        self.skins.insert(skin_key(source, name), skin);
+        let key = skin_key(source, name);
+        self.misses.remove(&key);
+        self.skins.insert(key, skin);
     }
 
-    /// Drops an entry; true if there was one.
-    pub fn remove(&mut self, source: Source, name: &str) -> bool {
-        self.skins.remove(&skin_key(source, name)).is_some()
+    /// Notes that the source has no skin for the name; it replaces a stored skin.
+    pub fn put_miss(&mut self, source: Source, name: &str, now_secs: u64) {
+        let key = skin_key(source, name);
+        self.skins.remove(&key);
+        self.misses.insert(key, now_secs);
+    }
+
+    /// True while a "not found" for the name is younger than `cache_minutes`: the
+    /// source need not be asked again yet.
+    pub fn is_missed(&self, source: Source, name: &str, now_secs: u64, cache_minutes: u64) -> bool {
+        self.misses
+            .get(&skin_key(source, name))
+            .is_some_and(|&at| now_secs.saturating_sub(at) < cache_minutes.saturating_mul(60))
+    }
+
+    /// Drops skins and misses at least `keep_secs` old; true if anything was dropped.
+    pub fn evict(&mut self, now_secs: u64, keep_secs: u64) -> bool {
+        let before = self.skins.len() + self.misses.len();
+        let old = |at: u64| now_secs.saturating_sub(at) >= keep_secs;
+        self.skins.retain(|_, c| !old(c.fetched_at));
+        self.misses.retain(|_, at| !old(*at));
+        before != self.skins.len() + self.misses.len()
     }
 }
 
-/// For each cache entry, the lookup engine's sequence number of the answer that last
-/// wrote it. Kept in memory only: an entry loaded from disk has no number and counts as
-/// 0, older than every answer of this run.
+/// For each cache key, the lookup engine's sequence number of the answer (a skin or a
+/// "not found") that last wrote it. Queries finish out of order, so an answer is only
+/// applied if it is newer than what the key already holds. Kept in memory only: a key
+/// loaded from disk has no number and counts as 0, older than every answer of this run.
 #[derive(Debug, Default)]
 pub struct CacheSeq {
     /// Keyed like [`Cache::skins`].
@@ -175,22 +210,16 @@ pub struct CacheSeq {
 }
 
 impl CacheSeq {
-    /// Notes that the entry was written from the answer numbered `seq`.
-    pub fn record_write(&mut self, source: Source, name: &str, seq: u64) {
-        self.written.insert(skin_key(source, name), seq);
-    }
-
-    /// Forgets a removed entry.
-    pub fn forget(&mut self, source: Source, name: &str) {
-        self.written.remove(&skin_key(source, name));
-    }
-
-    /// True if a "not found" numbered `not_found_seq` disproves the entry: the entry
-    /// was written from an earlier answer. One written from a later answer is newer
-    /// knowledge and stays.
-    pub fn should_remove(&self, source: Source, name: &str, not_found_seq: u64) -> bool {
+    /// True if the answer numbered `seq` is newer than the one the key was written
+    /// from. The same answer is not newer than itself.
+    pub fn is_newer(&self, source: Source, name: &str, seq: u64) -> bool {
         let entry_seq = self.written.get(&skin_key(source, name)).copied();
-        entry_seq.unwrap_or(0) < not_found_seq
+        entry_seq.unwrap_or(0) < seq
+    }
+
+    /// Notes that the key was written from the answer numbered `seq`.
+    pub fn record(&mut self, source: Source, name: &str, seq: u64) {
+        self.written.insert(skin_key(source, name), seq);
     }
 }
 
@@ -205,6 +234,11 @@ pub fn load<T: for<'de> Deserialize<'de> + Default>(text: Option<&str>) -> Resul
 
 pub fn to_json<T: Serialize>(value: &T) -> String {
     serde_json::to_string_pretty(value).expect("state always serialises")
+}
+
+/// Without indentation, for the cache: it is large and not meant to be edited.
+pub fn to_json_compact<T: Serialize>(value: &T) -> String {
+    serde_json::to_string(value).expect("state always serialises")
 }
 
 #[cfg(test)]
@@ -414,57 +448,89 @@ mod tests {
         assert!(load::<Players>(Some(text)).is_err());
     }
 
-    #[test]
-    fn cache_remove_drops_one_entry() {
-        let mut cache = Cache::default();
-        let entry = CachedSkin {
+    fn entry(at: u64) -> CachedSkin {
+        CachedSkin {
             value: "v".into(),
             signature: "s".into(),
             uuid: "u".into(),
-            fetched_at: 1000,
-        };
-        cache.put(Source::Ely, "alice", entry.clone());
-        cache.put(Source::Mojang, "alice", entry.clone());
-        assert!(cache.remove(Source::Ely, "ALICE"));
+            fetched_at: at,
+        }
+    }
+
+    #[test]
+    fn a_miss_replaces_the_skin_and_a_skin_replaces_the_miss() {
+        let mut cache = Cache::default();
+        cache.put(Source::Ely, "alice", entry(1000));
+        cache.put(Source::Mojang, "alice", entry(1000));
+        cache.put_miss(Source::Ely, "ALICE", 2000);
         assert_eq!(cache.get(Source::Ely, "alice"), None);
-        assert_eq!(cache.get(Source::Mojang, "alice"), Some(&entry));
-        assert!(!cache.remove(Source::Ely, "alice"));
+        assert_eq!(cache.get(Source::Mojang, "alice"), Some(&entry(1000)));
+        assert!(cache.is_missed(Source::Ely, "Alice", 2000, 15));
+        assert!(!cache.is_missed(Source::Mojang, "alice", 2000, 15));
+        cache.put(Source::Ely, "Alice", entry(3000));
+        assert!(!cache.is_missed(Source::Ely, "alice", 3000, 15));
+        assert!(cache.misses.is_empty());
     }
 
     #[test]
-    fn entry_written_after_the_not_found_is_kept() {
+    fn a_miss_expires_like_a_skin() {
+        let mut cache = Cache::default();
+        cache.put_miss(Source::Ely, "alice", 1000);
+        assert!(cache.is_missed(Source::Ely, "alice", 1000 + 15 * 60 - 1, 15));
+        assert!(!cache.is_missed(Source::Ely, "alice", 1000 + 15 * 60, 15));
+        // A miss from the future (clock set back) still counts.
+        assert!(cache.is_missed(Source::Ely, "alice", 0, 15));
+    }
+
+    #[test]
+    fn eviction_drops_old_skins_and_misses() {
+        let mut cache = Cache::default();
+        cache.put(Source::Ely, "old", entry(0));
+        cache.put(Source::Ely, "new", entry(500));
+        cache.put_miss(Source::Mojang, "old", 0);
+        cache.put_miss(Source::Mojang, "new", 500);
+        assert!(!cache.evict(999, 1000));
+        assert!(cache.evict(1000, 1000));
+        assert_eq!(cache.skins.keys().collect::<Vec<_>>(), ["ely:new"]);
+        assert_eq!(cache.misses.keys().collect::<Vec<_>>(), ["mojang:new"]);
+        assert!(!cache.evict(1000, 1000));
+    }
+
+    #[test]
+    fn entries_are_kept_for_a_month_or_the_cache_time() {
+        assert_eq!(keep_secs(15), CACHE_KEEP_SECS);
+        assert_eq!(keep_secs(525_600), 525_600 * 60);
+    }
+
+    #[test]
+    fn cache_without_misses_still_loads_and_the_cache_is_compact() {
+        let text = r#"{"skins":{"ely:a":{"value":"v","signature":"s","uuid":"u","fetched_at":1}}}"#;
+        let cache = load::<Cache>(Some(text)).unwrap();
+        assert!(cache.misses.is_empty());
+        assert_eq!(cache.get(Source::Ely, "a"), Some(&entry(1)));
+        assert!(!to_json_compact(&cache).contains('\n'));
+        assert_eq!(
+            load::<Cache>(Some(&to_json_compact(&cache))).unwrap(),
+            cache
+        );
+    }
+
+    #[test]
+    fn only_a_newer_answer_may_write_a_key() {
         let mut seqs = CacheSeq::default();
-        seqs.record_write(Source::Ely, "Alice", 7);
-        assert!(!seqs.should_remove(Source::Ely, "alice", 5));
-        // The same answer cannot disprove itself either.
-        assert!(!seqs.should_remove(Source::Ely, "alice", 7));
+        seqs.record(Source::Ely, "Alice", 7);
+        assert!(!seqs.is_newer(Source::Ely, "alice", 5));
+        // The same answer is not newer than itself.
+        assert!(!seqs.is_newer(Source::Ely, "alice", 7));
+        assert!(seqs.is_newer(Source::Ely, "ALICE", 8));
+        // Other keys are unaffected.
+        assert!(seqs.is_newer(Source::Mojang, "alice", 5));
     }
 
     #[test]
-    fn entry_written_before_the_not_found_is_removed() {
-        let mut seqs = CacheSeq::default();
-        seqs.record_write(Source::Ely, "alice", 5);
-        seqs.record_write(Source::Mojang, "alice", 9);
-        assert!(seqs.should_remove(Source::Ely, "ALICE", 7));
-        assert!(!seqs.should_remove(Source::Mojang, "alice", 7));
-        // A rewrite moves the entry behind the not-found again.
-        seqs.record_write(Source::Ely, "alice", 8);
-        assert!(!seqs.should_remove(Source::Ely, "alice", 7));
-    }
-
-    #[test]
-    fn entry_loaded_from_disk_is_removed_by_any_not_found() {
+    fn a_key_loaded_from_disk_is_older_than_any_answer() {
         let seqs = CacheSeq::default();
-        assert!(seqs.should_remove(Source::Ely, "alice", 1));
-        assert!(seqs.should_remove(Source::Ely, "alice", u64::MAX));
-    }
-
-    #[test]
-    fn forgotten_entry_counts_as_loaded_from_disk() {
-        let mut seqs = CacheSeq::default();
-        seqs.record_write(Source::Ely, "alice", 7);
-        assert!(!seqs.should_remove(Source::Ely, "alice", 5));
-        seqs.forget(Source::Ely, "Alice");
-        assert!(seqs.should_remove(Source::Ely, "alice", 5));
+        assert!(seqs.is_newer(Source::Ely, "alice", 1));
+        assert!(seqs.is_newer(Source::Ely, "alice", u64::MAX));
     }
 }

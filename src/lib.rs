@@ -1,6 +1,7 @@
-//! Ely.by and Mojang skins for the Pumpkin server. The pure modules are tested natively;
-//! `plugin` and `http` are the wasm-only glue.
+//! Ely.by and Mojang skins for the Pumpkin server. Everything but `plugin` and `http`,
+//! the wasm-only bindings, is tested natively; `app` holds the plugin's behaviour.
 
+pub mod app;
 pub mod command;
 pub mod config;
 pub mod lookup;
