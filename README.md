@@ -16,8 +16,9 @@ take on SkinsRestorer.
   5. otherwise Steve.
 - Logins never wait for the network. Skins come from the plugin's cache. A skin that is
   missing or older than `cache_minutes` is fetched in the background and shows at the
-  next join. If the fetched skin differs from the one the player got at login, they are
-  told "Your skin is ready, rejoin to see it."
+  next join. If the fetched skin differs from the one the player got at login and is
+  still the one they get at the next join, they are told "Your skin is ready, rejoin to
+  see it."
 - Automatic skins follow the source order: a cached skin from a lower-ranked source is
   used, but the sources ranked above it are still looked up, and win once they answer.
 - A changed skin always shows after the player rejoins. The plugin never kicks.

@@ -42,7 +42,9 @@ use crate::command::{SKIN_USAGE, SkinCmd, SkinSpec, parse_skin, parse_skull};
 use crate::config::{self, Config, DEFAULT_CONFIG, skin_key};
 use crate::http;
 use crate::lookup::{Engine, Outcome, QueryId, ReqId};
-use crate::resolve::{Apply, Cooldowns, Ops, Superseded, is_admin, may_commit, plan_login};
+use crate::resolve::{
+    Apply, Cooldowns, Ops, Superseded, is_admin, may_commit, plan_login, result_applies,
+};
 use crate::skin::{profile_component, skin_url, steve};
 use crate::source::{SkinData, Source};
 use crate::store::{self, Cache, CachedSkin, Choice, PlayerRecord, Players, player_key, to_json};
@@ -89,17 +91,24 @@ enum Purpose {
         recipient_key: String,
         /// Account name as typed; it names the head.
         name: String,
+        /// A target player was given: the issuer must still be an admin at delivery.
+        admin_required: bool,
     },
     /// Queued at login; `dedupe` is its entry in `State::login_lookups`.
     Login {
         dedupe: String,
-        /// Account name being looked up.
-        name: String,
-        /// Every player waiting for this lookup, with the skin URL applied at their
-        /// login, if any: a player is only told about a skin they are not already
-        /// wearing.
-        waiters: Vec<(Uuid, Option<String>)>,
+        /// Every player waiting for this lookup.
+        waiters: Vec<LoginWaiter>,
     },
+}
+
+struct LoginWaiter {
+    player: Uuid,
+    /// Key of the player's record.
+    key: String,
+    /// Skin URL applied at their login, if any: a player is only told about a skin
+    /// they are not already wearing.
+    applied: Option<String>,
 }
 
 /// Host calls to make once the state borrow has ended.
@@ -122,7 +131,8 @@ struct State {
     cache: Cache,
     engine: Engine,
     http: HashMap<ReqId, http::Request>,
-    purposes: HashMap<QueryId, Purpose>,
+    /// Running lookups: the name looked up and what it is for.
+    purposes: HashMap<QueryId, (String, Purpose)>,
     ops: Ops,
     cooldowns: Cooldowns,
     /// Running login lookups by dedupe key.
@@ -308,22 +318,29 @@ fn on_login(player: &Player) {
                 Apply::Steve | Apply::Keep => None,
             };
             let running = s.login_lookups.get(&dedupe).copied();
-            if let Some(Purpose::Login { waiters, .. }) =
+            let waiter = LoginWaiter {
+                player: id,
+                key,
+                applied,
+            };
+            if let Some((_, Purpose::Login { waiters, .. })) =
                 running.and_then(|q| s.purposes.get_mut(&q))
             {
                 // Same lookup already running: wait for it too. A rejoining player
                 // replaces their earlier entry.
-                waiters.retain(|(waiting, _)| wit_uuid::to_string(*waiting) != uuid);
-                waiters.push((id, applied));
+                waiters.retain(|w| wit_uuid::to_string(w.player) != uuid);
+                waiters.push(waiter);
             } else if let Ok(q) = s.engine.submit(&wanted.name, &wanted.sources, now) {
                 s.login_lookups.insert(dedupe.clone(), q);
                 s.purposes.insert(
                     q,
-                    Purpose::Login {
-                        dedupe,
-                        name: wanted.name.clone(),
-                        waiters: vec![(id, applied)],
-                    },
+                    (
+                        wanted.name.clone(),
+                        Purpose::Login {
+                            dedupe,
+                            waiters: vec![waiter],
+                        },
+                    ),
                 );
             }
             // Busy: the stored skin stays in use; the next login tries again.
@@ -403,19 +420,29 @@ fn warn_failed_lookup(s: &mut State, name: &str, error: &str, now: u64) {
     log(Level::Warn, &message);
 }
 
+/// Acts on a finished lookup of `lookup_name`.
 fn finish(
     s: &mut State,
     server: &ServerInstance,
+    lookup_name: &str,
     purpose: Purpose,
     outcome: Outcome,
     now: u64,
 ) -> Vec<Effect> {
+    // A source that no longer has a skin for the name must not keep winning from the
+    // cache.
+    for &source in outcome.not_found_in() {
+        if s.cache.remove(source, lookup_name) {
+            s.cache_dirty = true;
+        }
+    }
     let found = match &outcome {
         Outcome::Found {
             source,
             name,
             uuid,
             skin,
+            ..
         } => {
             s.cache.put(
                 *source,
@@ -434,8 +461,8 @@ fn finish(
     };
     let failure = match &outcome {
         Outcome::Found { .. } => String::new(),
-        Outcome::NotFound => "no skin found".to_string(),
-        Outcome::Failed(e) => format!("skin lookup failed: {e}"),
+        Outcome::NotFound { .. } => "no skin found".to_string(),
+        Outcome::Failed { error, .. } => format!("skin lookup failed: {error}"),
     };
     let mut effects = Vec::new();
     match purpose {
@@ -486,36 +513,51 @@ fn finish(
             recipient_name,
             recipient_key,
             name,
+            admin_required,
         } => {
             s.ops.end(&recipient_key);
-            start_cooldown(s, &issuer, found.is_some(), now);
-            match found {
-                Some((_, _, skin)) => effects.push(Effect::GiveSkull {
+            // The rules may have changed while the lookup ran.
+            let refused = match &found {
+                Some((source, found_name, _)) if s.cfg.is_blocked(*source, found_name) => {
+                    Some(Superseded::Blocked)
+                }
+                Some(_) if admin_required && !issuer_is_admin(server, &issuer, &s.cfg) => {
+                    Some(Superseded::NotAdmin)
+                }
+                _ => None,
+            };
+            start_cooldown(s, &issuer, found.is_some() && refused.is_none(), now);
+            match (found, refused) {
+                (Some(_), Some(why)) => effects.push(Effect::Tell(
+                    issuer,
+                    format!("Head not given: {}.", superseded_reason(&why)),
+                )),
+                (Some((_, _, skin)), None) => effects.push(Effect::GiveSkull {
                     issuer,
                     recipient,
                     recipient_name,
                     name,
                     skin,
                 }),
-                None => effects.push(Effect::Tell(issuer, format!("No head: {failure}."))),
+                (None, _) => effects.push(Effect::Tell(issuer, format!("No head: {failure}."))),
             }
         }
-        Purpose::Login {
-            dedupe,
-            name,
-            waiters,
-        } => {
+        Purpose::Login { dedupe, waiters } => {
             s.login_lookups.remove(&dedupe);
-            if let Outcome::Failed(e) = &outcome {
-                warn_failed_lookup(s, &name, e, now);
+            if let Outcome::Failed { error, .. } = &outcome {
+                warn_failed_lookup(s, lookup_name, error, now);
             }
-            if let Some((_, _, skin)) = &found {
+            if let Some((source, found_name, skin)) = &found {
                 // Compared by URL: the textures value carries a fresh timestamp.
                 let url = skin_url(&skin.value);
-                for (player, applied) in waiters {
-                    if applied.is_none() || applied != url {
+                for waiter in waiters {
+                    // Only players who get this skin at their next join are told.
+                    let applies = s.players.players.get(&waiter.key).is_some_and(|record| {
+                        result_applies(record, &record.name, *source, found_name, &s.cfg)
+                    });
+                    if applies && (waiter.applied.is_none() || waiter.applied != url) {
                         effects.push(Effect::TellPlayer(
-                            player,
+                            waiter.player,
                             "Your skin is ready, rejoin to see it.".into(),
                         ));
                     }
@@ -594,8 +636,8 @@ async fn tick(server: &ServerInstance) {
         }
         let mut effects = Vec::new();
         for (q, outcome) in s.engine.take_finished() {
-            if let Some(purpose) = s.purposes.remove(&q) {
-                effects.extend(finish(s, server, purpose, outcome, now));
+            if let Some((name, purpose)) = s.purposes.remove(&q) {
+                effects.extend(finish(s, server, &name, purpose, outcome, now));
             }
         }
         if std::mem::take(&mut s.cache_dirty) {
@@ -686,7 +728,7 @@ fn start_lookup(
     s.ops.begin(pending_key);
     match s.engine.submit(name, sources, now) {
         Ok(q) => {
-            s.purposes.insert(q, purpose);
+            s.purposes.insert(q, (name.to_string(), purpose));
             Ok(q)
         }
         Err(_) => {
@@ -746,8 +788,11 @@ fn recreated_note(recreated: bool, reply: String) -> String {
 
 fn edit_block_list(s: &mut State, entry: &str, add: bool) -> Result<String, String> {
     let (current, recreated) = config_text()?;
+    // The file is re-read as on `/skin reload`, also when the list stays as it is. An
+    // invalid file is refused and the previous config stays.
+    let current_cfg = config::parse(&current)?;
     if recreated {
-        s.cfg = config::parse(&current)?;
+        s.cfg = current_cfg.clone();
     }
     let edited = if add {
         config::add_blocked(&current, entry)?
@@ -765,8 +810,14 @@ fn edit_block_list(s: &mut State, entry: &str, add: bool) -> Result<String, Stri
                 format!("Unblocked {entry}.")
             }
         }
-        None if add => format!("{entry} was already blocked."),
-        None => format!("{entry} was not blocked."),
+        None => {
+            s.cfg = current_cfg;
+            if add {
+                format!("{entry} was already blocked.")
+            } else {
+                format!("{entry} was not blocked.")
+            }
+        }
     };
     Ok(recreated_note(recreated, reply))
 }
@@ -956,6 +1007,7 @@ async fn handle_skull(sender: &CommandSender, server: &ServerInstance, raw: &str
             recipient_name,
             recipient_key: recipient_key.clone(),
             name: spec.name.clone(),
+            admin_required: target.is_some(),
         };
         start_lookup(s, &who, &recipient_key, &spec.name, &sources, purpose, now)?;
         Ok((format!("Looking up {}...", spec.name), None))

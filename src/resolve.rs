@@ -137,6 +137,26 @@ pub fn plan_login(
     }
 }
 
+/// Whether a skin found by a login lookup is the one `record`'s player gets at the next
+/// join: they are not locked, and the found skin is either their unblocked explicit
+/// choice or, in automatic mode, their own name's skin from an unblocked source.
+/// `found_name` is lowercase.
+pub fn result_applies(
+    record: &PlayerRecord,
+    own_name: &str,
+    found_source: Source,
+    found_name: &str,
+    cfg: &Config,
+) -> bool {
+    if record.locked || cfg.is_blocked(found_source, found_name) {
+        return false;
+    }
+    match &record.choice {
+        Choice::Skin { source, name } => *source == found_source && name == found_name,
+        Choice::Auto => found_name == own_name.to_ascii_lowercase(),
+    }
+}
+
 /// Operator level at least `admin_op_level`, or a player UUID listed in `admins`.
 pub fn is_admin(op_level: u8, player_uuid: Option<&str>, cfg: &Config) -> bool {
     op_level >= cfg.admin_op_level || player_uuid.is_some_and(|u| cfg.is_admin_uuid(u))
@@ -519,5 +539,59 @@ mod tests {
         let start = ops.revision("a");
         ops.bump("a");
         assert_ne!(ops.revision("a"), start);
+    }
+
+    #[test]
+    fn result_applies_to_the_matching_choice() {
+        let cfg = Config::default();
+        let r = record(Choice::skin(Source::Mojang, "notch"));
+        assert!(result_applies(&r, "Alice", Source::Mojang, "notch", &cfg));
+        // Same name from another source is a different skin.
+        assert!(!result_applies(&r, "Alice", Source::Ely, "notch", &cfg));
+    }
+
+    #[test]
+    fn result_applies_to_the_own_name_in_auto() {
+        let cfg = Config::default();
+        let r = record(Choice::Auto);
+        assert!(result_applies(&r, "Alice", Source::Ely, "alice", &cfg));
+        assert!(result_applies(&r, "Alice", Source::Mojang, "alice", &cfg));
+    }
+
+    #[test]
+    fn result_does_not_apply_to_a_locked_player() {
+        let cfg = Config::default();
+        let mut r = record(Choice::skin(Source::Mojang, "notch"));
+        r.locked = true;
+        assert!(!result_applies(&r, "Alice", Source::Mojang, "notch", &cfg));
+        let mut r = record(Choice::Auto);
+        r.locked = true;
+        assert!(!result_applies(&r, "Alice", Source::Ely, "alice", &cfg));
+    }
+
+    #[test]
+    fn result_does_not_apply_after_the_choice_changed() {
+        let cfg = Config::default();
+        let r = record(Choice::skin(Source::Mojang, "jeb_"));
+        assert!(!result_applies(&r, "Alice", Source::Mojang, "notch", &cfg));
+        // A lookup for the own name does not apply to an explicit choice.
+        assert!(!result_applies(&r, "Alice", Source::Ely, "alice", &cfg));
+    }
+
+    #[test]
+    fn result_for_the_old_choice_does_not_apply_after_a_clear() {
+        let cfg = Config::default();
+        let r = record(Choice::Auto);
+        assert!(!result_applies(&r, "Alice", Source::Mojang, "notch", &cfg));
+    }
+
+    #[test]
+    fn blocked_result_does_not_apply() {
+        let cfg = parse(r#"blocked = ["mojang:notch", "ely:alice"]"#).unwrap();
+        let r = record(Choice::skin(Source::Mojang, "notch"));
+        assert!(!result_applies(&r, "Alice", Source::Mojang, "notch", &cfg));
+        let r = record(Choice::Auto);
+        assert!(!result_applies(&r, "Alice", Source::Ely, "alice", &cfg));
+        assert!(result_applies(&r, "Alice", Source::Mojang, "alice", &cfg));
     }
 }

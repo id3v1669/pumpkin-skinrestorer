@@ -29,9 +29,29 @@ pub enum Outcome {
         name: String,
         uuid: String,
         skin: SkinData,
+        /// Sources tried before `source` that have no usable skin for the name.
+        not_found_in: Vec<Source>,
     },
-    NotFound,
-    Failed(String),
+    /// Every source answered that it has no usable skin.
+    NotFound { not_found_in: Vec<Source> },
+    Failed {
+        error: String,
+        not_found_in: Vec<Source>,
+    },
+}
+
+impl Outcome {
+    /// Sources that answered an authoritative "not found" for the query's name: HTTP
+    /// 204/404, a name missing from the bulk answer, or a skin that is not signed or
+    /// not vanilla. Transport errors, rate limits, other HTTP statuses and "busy" are
+    /// not listed: they say nothing about the account.
+    pub fn not_found_in(&self) -> &[Source] {
+        match self {
+            Outcome::Found { not_found_in, .. }
+            | Outcome::NotFound { not_found_in }
+            | Outcome::Failed { not_found_in, .. } => not_found_in,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -43,6 +63,7 @@ struct Query {
     name: String,
     remaining: VecDeque<Source>,
     errors: Vec<String>,
+    not_found_in: Vec<Source>,
 }
 
 enum Stage {
@@ -108,6 +129,7 @@ impl Engine {
                 name,
                 remaining: sources.iter().copied().collect(),
                 errors: Vec::new(),
+                not_found_in: Vec::new(),
             },
         );
         self.advance(id, now);
@@ -131,10 +153,14 @@ impl Engine {
             };
             let Some(source) = query.remaining.pop_front() else {
                 let query = self.queries.remove(&id).expect("query exists");
+                let not_found_in = query.not_found_in;
                 let outcome = if query.errors.is_empty() {
-                    Outcome::NotFound
+                    Outcome::NotFound { not_found_in }
                 } else {
-                    Outcome::Failed(query.errors.join("; "))
+                    Outcome::Failed {
+                        error: query.errors.join("; "),
+                        not_found_in,
+                    }
                 };
                 self.finished.push((id, outcome));
                 return;
@@ -186,7 +212,11 @@ impl Engine {
         for id in state.waiters {
             match &result {
                 Ok(Some((uuid, skin))) => {
-                    self.queries.remove(&id);
+                    let not_found_in = self
+                        .queries
+                        .remove(&id)
+                        .map(|q| q.not_found_in)
+                        .unwrap_or_default();
                     self.finished.push((
                         id,
                         Outcome::Found {
@@ -194,10 +224,16 @@ impl Engine {
                             name: key.1.clone(),
                             uuid: uuid.clone(),
                             skin: skin.clone(),
+                            not_found_in,
                         },
                     ));
                 }
-                Ok(None) => self.advance(id, now),
+                Ok(None) => {
+                    if let Some(q) = self.queries.get_mut(&id) {
+                        q.not_found_in.push(key.0);
+                    }
+                    self.advance(id, now);
+                }
                 Err(e) => {
                     if let Some(q) = self.queries.get_mut(&id) {
                         q.errors.push(format!("{}: {e}", key.0.as_str()));
@@ -366,6 +402,20 @@ mod tests {
         })
     }
 
+    fn not_found(sources: &[Source]) -> Outcome {
+        Outcome::NotFound {
+            not_found_in: sources.to_vec(),
+        }
+    }
+
+    /// A failure without any source answering "not found".
+    fn failed(error: &str) -> Outcome {
+        Outcome::Failed {
+            error: error.into(),
+            not_found_in: Vec::new(),
+        }
+    }
+
     fn profile_body() -> String {
         let value = base64::engine::general_purpose::STANDARD
             .encode(r#"{"textures":{"SKIN":{"url":"http://textures.minecraft.net/texture/a"}}}"#);
@@ -461,7 +511,7 @@ mod tests {
         e.submit("Notch", &[Source::Mojang], 0).unwrap();
         let reqs = e.poll_requests(1000);
         e.on_response(reqs[0].0, status(204, None), 1000);
-        assert_eq!(e.take_finished()[0].1, Outcome::NotFound);
+        assert_eq!(e.take_finished()[0].1, not_found(&[Source::Mojang]));
         assert_eq!(e.queued(), 0);
     }
 
@@ -494,7 +544,7 @@ mod tests {
         // Ely.by stays paused for 30 s: a prefixed lookup fails without a request.
         e.submit("Other", &[Source::Ely], 3000).unwrap();
         assert!(e.poll_requests(4000).is_empty());
-        assert!(matches!(e.take_finished()[0].1, Outcome::Failed(_)));
+        assert!(matches!(e.take_finished()[0].1, Outcome::Failed { .. }));
         // After the pause it is used again.
         e.submit("Other", &[Source::Ely], 31_000).unwrap();
         assert_eq!(e.poll_requests(32_000).len(), 1);
@@ -506,10 +556,7 @@ mod tests {
         e.submit("Notch", &[Source::Mojang], 0).unwrap();
         let reqs = e.poll_requests(1000);
         e.on_response(reqs[0].0, Err("timed out".into()), 1000);
-        assert_eq!(
-            e.take_finished()[0].1,
-            Outcome::Failed("mojang: timed out".into())
-        );
+        assert_eq!(e.take_finished()[0].1, failed("mojang: timed out"));
         assert_eq!(e.queued(), 0);
     }
 
@@ -529,7 +576,7 @@ mod tests {
             ok(r#"{"id":"069a79f444e94726a5befca90e38aaf5","name":"Notch","properties":[]}"#),
             1000,
         );
-        assert_eq!(e.take_finished()[0].1, Outcome::NotFound);
+        assert_eq!(e.take_finished()[0].1, not_found(&[Source::Mojang]));
         assert_eq!(e.queued(), 0);
     }
 
@@ -593,10 +640,7 @@ mod tests {
         assert_eq!(e.take_finished().len(), 2);
         e.submit("c", &[Source::Mojang], 4000).unwrap();
         assert!(e.poll_requests(5000).is_empty());
-        assert_eq!(
-            e.take_finished()[0].1,
-            Outcome::Failed("mojang is rate limited".into())
-        );
+        assert_eq!(e.take_finished()[0].1, failed("mojang is rate limited"));
         assert_eq!(e.queued(), 0);
     }
 
@@ -606,12 +650,9 @@ mod tests {
         e.submit("a", &[Source::Mojang], 0).unwrap();
         let reqs = e.poll_requests(1000);
         e.on_response(reqs[0].0, status(429, Some(u64::MAX)), 1000);
-        assert_eq!(
-            e.take_finished()[0].1,
-            Outcome::Failed("mojang: rate limited".into())
-        );
+        assert_eq!(e.take_finished()[0].1, failed("mojang: rate limited"));
         e.submit("b", &[Source::Mojang], u64::MAX - 1).unwrap();
-        assert!(matches!(e.take_finished()[0].1, Outcome::Failed(_)));
+        assert!(matches!(e.take_finished()[0].1, Outcome::Failed { .. }));
         assert_eq!(e.queued(), 0);
     }
 
@@ -625,10 +666,7 @@ mod tests {
         let skins = e.poll_requests(1000);
         assert_eq!(skins.len(), 2);
         e.on_response(skin_req_for(&skins, "b"), status(429, None), 1000);
-        assert_eq!(
-            e.take_finished()[0].1,
-            Outcome::Failed("mojang: rate limited".into())
-        );
+        assert_eq!(e.take_finished()[0].1, failed("mojang: rate limited"));
         // Mojang is paused, but the lookup for "a" is already running: join it.
         e.submit("A", &[Source::Mojang], 1100).unwrap();
         assert!(e.take_finished().is_empty());
@@ -669,7 +707,13 @@ mod tests {
         assert_eq!(done.len(), BATCH_SIZE + 1);
         let busy: Vec<_> = done.iter().filter(|(id, _)| *id == q).collect();
         assert_eq!(busy.len(), 1);
-        assert_eq!(busy[0].1, Outcome::Failed("busy".into()));
+        assert_eq!(
+            busy[0].1,
+            Outcome::Failed {
+                error: "busy".into(),
+                not_found_in: vec![Source::Mojang],
+            }
+        );
         assert_eq!(e.queued(), MAX_QUEUED - BATCH_SIZE);
     }
 
@@ -712,17 +756,11 @@ mod tests {
         e.on_response(batch[0].0, ok(&ids(&["a"])), 1000);
         let skins = e.poll_requests(1000);
         e.on_response(skins[0].0, status(429, None), 1000);
-        assert_eq!(
-            e.take_finished()[0].1,
-            Outcome::Failed("mojang: rate limited".into())
-        );
+        assert_eq!(e.take_finished()[0].1, failed("mojang: rate limited"));
         assert_eq!(e.queued(), 0);
         let end = 1000 + DEFAULT_BACKOFF_SECS * 1000;
         e.submit("b", &[Source::Mojang], end - 1).unwrap();
-        assert_eq!(
-            e.take_finished()[0].1,
-            Outcome::Failed("mojang is rate limited".into())
-        );
+        assert_eq!(e.take_finished()[0].1, failed("mojang is rate limited"));
         e.submit("b", &[Source::Mojang], end).unwrap();
         assert!(e.take_finished().is_empty());
         assert_eq!(e.poll_requests(end + BATCH_WINDOW_MS).len(), 1);
@@ -737,10 +775,7 @@ mod tests {
         e.on_response(batch[0].0, status(429, Some(30)), 1500);
         assert_eq!(e.take_finished().len(), 1);
         assert!(e.poll_requests(2000).is_empty());
-        assert_eq!(
-            e.take_finished()[0].1,
-            Outcome::Failed("mojang: rate limited".into())
-        );
+        assert_eq!(e.take_finished()[0].1, failed("mojang: rate limited"));
         assert_eq!(e.queued(), 0);
     }
 
@@ -756,10 +791,7 @@ mod tests {
         e.on_response(second[0].0, status(429, Some(30)), 2000);
         assert_eq!(e.take_finished().len(), 1);
         assert!(e.poll_requests(2000).is_empty());
-        assert_eq!(
-            e.take_finished()[0].1,
-            Outcome::Failed("mojang: rate limited".into())
-        );
+        assert_eq!(e.take_finished()[0].1, failed("mojang: rate limited"));
         assert_eq!(e.queued(), 0);
     }
 
@@ -791,7 +823,7 @@ mod tests {
         assert_eq!(batch.len(), 1);
         e.on_response(batch[0].0, ok(&ids(&["b"])), 1000);
         // "c" has no other source, "a" moves to Mojang, "b" gets its skin request.
-        assert_eq!(e.take_finished(), vec![(c, Outcome::NotFound)]);
+        assert_eq!(e.take_finished(), vec![(c, not_found(&[Source::Ely]))]);
         let reqs = e.poll_requests(2000);
         assert_eq!(reqs.len(), 2);
         let mojang = reqs
@@ -838,10 +870,7 @@ mod tests {
         e.submit("a", &[Source::Mojang], 0).unwrap();
         let reqs = e.poll_requests(1000);
         e.on_response(reqs[0].0, status(500, None), 1000);
-        assert_eq!(
-            e.take_finished()[0].1,
-            Outcome::Failed("mojang: HTTP 500".into())
-        );
+        assert_eq!(e.take_finished()[0].1, failed("mojang: HTTP 500"));
         assert_eq!(e.queued(), 0);
     }
 
@@ -852,7 +881,9 @@ mod tests {
         let reqs = e.poll_requests(1000);
         e.on_response(reqs[0].0, ok("not json"), 1000);
         match &e.take_finished()[0].1 {
-            Outcome::Failed(msg) => assert!(msg.starts_with("mojang: bad name lookup answer")),
+            Outcome::Failed { error: msg, .. } => {
+                assert!(msg.starts_with("mojang: bad name lookup answer"))
+            }
             other => panic!("unexpected {other:?}"),
         }
         assert_eq!(e.queued(), 0);
@@ -863,7 +894,9 @@ mod tests {
         let reqs = e.poll_requests(3000);
         e.on_response(reqs[0].0, ok("not json"), 3000);
         match &e.take_finished()[0].1 {
-            Outcome::Failed(msg) => assert!(msg.starts_with("mojang: bad profile answer")),
+            Outcome::Failed { error: msg, .. } => {
+                assert!(msg.starts_with("mojang: bad profile answer"))
+            }
             other => panic!("unexpected {other:?}"),
         }
         assert_eq!(e.queued(), 0);
@@ -873,7 +906,111 @@ mod tests {
     fn no_sources_is_not_found_at_once() {
         let mut e = Engine::new();
         let q = e.submit("a", &[], 0).unwrap();
-        assert_eq!(e.take_finished(), vec![(q, Outcome::NotFound)]);
+        assert_eq!(e.take_finished(), vec![(q, not_found(&[]))]);
         assert_eq!(e.queued(), 0);
+    }
+
+    #[test]
+    fn not_found_before_a_hit_is_reported() {
+        let mut e = Engine::new();
+        e.submit("Alice", &[Source::Ely, Source::Mojang], 0)
+            .unwrap();
+        let reqs = e.poll_requests(1000);
+        e.on_response(reqs[0].0, status(204, None), 1000);
+        answer_found(&mut e, 2000, "alice");
+        match &e.take_finished()[0].1 {
+            Outcome::Found {
+                source,
+                not_found_in,
+                ..
+            } => assert_eq!(
+                (*source, not_found_in),
+                (Source::Mojang, &vec![Source::Ely])
+            ),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transport_error_before_a_hit_is_not_a_not_found() {
+        let mut e = Engine::new();
+        e.submit("Alice", &[Source::Ely, Source::Mojang], 0)
+            .unwrap();
+        let reqs = e.poll_requests(1000);
+        e.on_response(reqs[0].0, Err("timed out".into()), 1000);
+        answer_found(&mut e, 2000, "alice");
+        match &e.take_finished()[0].1 {
+            Outcome::Found {
+                source,
+                not_found_in,
+                ..
+            } => assert_eq!((*source, not_found_in), (Source::Mojang, &vec![])),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rate_limit_and_server_error_are_not_a_not_found() {
+        for code in [429, 500] {
+            let mut e = Engine::new();
+            e.submit("Alice", &[Source::Ely, Source::Mojang], 0)
+                .unwrap();
+            let reqs = e.poll_requests(1000);
+            e.on_response(reqs[0].0, status(code, None), 1000);
+            answer_found(&mut e, 2000, "alice");
+            match &e.take_finished()[0].1 {
+                Outcome::Found { not_found_in, .. } => assert!(not_found_in.is_empty()),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn unsigned_skin_before_a_hit_is_reported() {
+        let mut e = Engine::new();
+        e.submit("Alice", &[Source::Ely, Source::Mojang], 0)
+            .unwrap();
+        let reqs = e.poll_requests(1000);
+        e.on_response(reqs[0].0, ok(&ids(&["alice"])), 1000);
+        let reqs = e.poll_requests(1000);
+        e.on_response(
+            reqs[0].0,
+            ok(r#"{"id":"u","name":"n","properties":[]}"#),
+            1000,
+        );
+        answer_found(&mut e, 2000, "alice");
+        match &e.take_finished()[0].1 {
+            Outcome::Found { not_found_in, .. } => assert_eq!(not_found_in, &vec![Source::Ely]),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn not_found_and_failed_report_the_sources_without_a_skin() {
+        let mut e = Engine::new();
+        e.submit("Alice", &[Source::Ely, Source::Mojang], 0)
+            .unwrap();
+        let reqs = e.poll_requests(1000);
+        e.on_response(reqs[0].0, ok("[]"), 1000);
+        let reqs = e.poll_requests(2000);
+        e.on_response(reqs[0].0, status(404, None), 2000);
+        assert_eq!(
+            e.take_finished()[0].1,
+            not_found(&[Source::Ely, Source::Mojang])
+        );
+
+        e.submit("Alice", &[Source::Ely, Source::Mojang], 3000)
+            .unwrap();
+        let reqs = e.poll_requests(4000);
+        e.on_response(reqs[0].0, ok("[]"), 4000);
+        let reqs = e.poll_requests(5000);
+        e.on_response(reqs[0].0, Err("timed out".into()), 5000);
+        assert_eq!(
+            e.take_finished()[0].1,
+            Outcome::Failed {
+                error: "mojang: timed out".into(),
+                not_found_in: vec![Source::Ely],
+            }
+        );
     }
 }

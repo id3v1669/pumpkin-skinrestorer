@@ -158,6 +158,11 @@ impl Cache {
     pub fn put(&mut self, source: Source, name: &str, skin: CachedSkin) {
         self.skins.insert(skin_key(source, name), skin);
     }
+
+    /// Drops an entry; true if there was one.
+    pub fn remove(&mut self, source: Source, name: &str) -> bool {
+        self.skins.remove(&skin_key(source, name)).is_some()
+    }
 }
 
 /// Reads a JSON state file. A missing file is empty state; a corrupt one is an error,
@@ -378,5 +383,22 @@ mod tests {
     fn invalid_choice_string_is_rejected() {
         let text = r#"{"players":{"alice":{"name":"Alice","uuid":"u","choice":"nope"}}}"#;
         assert!(load::<Players>(Some(text)).is_err());
+    }
+
+    #[test]
+    fn cache_remove_drops_one_entry() {
+        let mut cache = Cache::default();
+        let entry = CachedSkin {
+            value: "v".into(),
+            signature: "s".into(),
+            uuid: "u".into(),
+            fetched_at: 1000,
+        };
+        cache.put(Source::Ely, "alice", entry.clone());
+        cache.put(Source::Mojang, "alice", entry.clone());
+        assert!(cache.remove(Source::Ely, "ALICE"));
+        assert_eq!(cache.get(Source::Ely, "alice"), None);
+        assert_eq!(cache.get(Source::Mojang, "alice"), Some(&entry));
+        assert!(!cache.remove(Source::Ely, "alice"));
     }
 }
